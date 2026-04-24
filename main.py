@@ -1,41 +1,64 @@
+import logging
 import os
 import sys
+import time
 import traceback
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 import numpy as np
+
+_log = logging.getLogger(__name__)
 from astropy.io import fits
+from astropy.visualization import ZScaleInterval
+from scipy.stats import median_abs_deviation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QGraphicsView,
-    QGraphicsScene, QGraphicsPixmapItem, QSizePolicy,
+    QGraphicsScene, QGraphicsPixmapItem, QSizePolicy, QWidget,
 )
-from PySide6.QtGui import QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut, QPainter
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtGui import (
+    QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
+    QPainter, QColor, QPen, QBrush, QPolygon,
+)
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint
 
 
 # ---------------------------------------------------------------------------
 # Image conversion helpers
 # ---------------------------------------------------------------------------
 
-def _normalize(arr: np.ndarray) -> np.ndarray:
-    """1–99 percentile stretch → uint8."""
+def _normalize(arr: np.ndarray,
+               vmin: float | None = None,
+               vmax: float | None = None,
+               gamma: float = 0.5) -> np.ndarray:
+    """Stretch arr → uint8.
+
+    vmin/vmax: data values for black/white points (default: 1st/99th percentile).
+    gamma: mid-point position as a fraction of [vmin, vmax] (0–1, default 0.5 = linear).
+    """
     a = arr.astype(np.float64)
-    vmin, vmax = np.nanpercentile(a, [1, 99])
+    if vmin is None:
+        vmin = float(np.nanpercentile(a, 1))
+    if vmax is None:
+        vmax = float(np.nanpercentile(a, 99))
     if vmax == vmin:
         vmax = vmin + 1.0
-    return np.clip((a - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+    t = np.clip((a - vmin) / (vmax - vmin), 0.0, 1.0)
+    if abs(gamma - 0.5) > 1e-4:
+        g = float(np.clip(gamma, 1e-6, 1.0 - 1e-6))
+        exp = np.log(0.5) / np.log(g)
+        t = np.power(np.maximum(t, 0.0), exp)
+    return (t * 255.0).astype(np.uint8)
 
 
 def _gray_to_qimage(gray: np.ndarray) -> QImage:
-    """(H, W) uint8 → QImage (grayscale). Safe to call from any thread."""
+    """(H, W) uint8 → QImage grayscale. Thread-safe."""
     gray = np.ascontiguousarray(gray)
     h, w = gray.shape
-    # .copy() makes QImage own its pixel buffer so the numpy array can be freed.
     return QImage(gray.data, w, h, w, QImage.Format.Format_Grayscale8).copy()
 
 
 def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
-    """(H, W, 3) uint8 → QImage (RGB888). Safe to call from any thread."""
+    """(H, W, 3) uint8 → QImage RGB888. Thread-safe."""
     rgb = np.ascontiguousarray(rgb)
     h, w = rgb.shape[:2]
     return QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
@@ -45,152 +68,401 @@ def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
 # Bayer demosaicing
 # ---------------------------------------------------------------------------
 
-# How many rows/cols to roll each pattern so R lands at (0, 0) → RGGB.
-# np.roll(a, shift) moves a[i] → a[i + shift], so a[0] ← a[-shift].
-# We need a[-shift_r, -shift_c] == R pixel, i.e. shift = -R_position.
 _BAYER_TO_RGGB_ROLL: dict[str, tuple[int, int]] = {
-    # pattern  R is at    roll = -R_pos
-    "RGGB": (0, 0),   # R at (0,0) → roll (0, 0)
-    "BGGR": (-1, -1), # R at (1,1) → roll (-1,-1)
-    "GRBG": (0, -1),  # R at (0,1) → roll (0,-1)
-    "GBRG": (-1, 0),  # R at (1,0) → roll (-1, 0)
+    "RGGB": (0,  0),
+    "BGGR": (-1, -1),
+    "GRBG": (0,  -1),
+    "GBRG": (-1,  0),
 }
 
 
 def _debayer_rggb(raw: np.ndarray) -> np.ndarray:
-    """
-    Bilinear demosaicing of a 2-D array that is already in RGGB layout:
-        R G R G …   (even rows)
-        G B G B …   (odd rows)
-
-    Returns (H, W, 3) float64 with the same value range as the input.
-    """
+    """Bilinear demosaicing of a 2-D RGGB array → (H, W, 3) float64."""
     h, w = raw.shape
     d = raw.astype(np.float64)
-
-    # Pad by 2 with reflection so edge arithmetic never goes out of bounds.
     p = np.pad(d, 2, mode="reflect")
 
-    def s(dr: int, dc: int) -> np.ndarray:
-        """Return the original-sized slice of p shifted by (dr, dc)."""
+    def s(dr, dc):
         return p[2 + dr: 2 + dr + h, 2 + dc: 2 + dc + w]
 
-    # Boolean masks for each tile position
     rr, cc = np.mgrid[0:h, 0:w]
-    at_R  = (rr % 2 == 0) & (cc % 2 == 0)  # R
-    at_Gr = (rr % 2 == 0) & (cc % 2 == 1)  # G on R-row
-    at_Gb = (rr % 2 == 1) & (cc % 2 == 0)  # G on B-row
-    at_B  = (rr % 2 == 1) & (cc % 2 == 1)  # B
+    at_R  = (rr % 2 == 0) & (cc % 2 == 0)
+    at_Gr = (rr % 2 == 0) & (cc % 2 == 1)
+    at_Gb = (rr % 2 == 1) & (cc % 2 == 0)
+    at_B  = (rr % 2 == 1) & (cc % 2 == 1)
 
-    # R channel -----------------------------------------------------------
-    # known at R; horiz-avg at Gr; vert-avg at Gb; diag-avg at B
     R = np.where(at_R,  d,
-        np.where(at_Gr, (s(0, -1) + s(0, +1)) / 2,
-        np.where(at_Gb, (s(-1, 0) + s(+1, 0)) / 2,
-                        (s(-1, -1) + s(-1, +1) + s(+1, -1) + s(+1, +1)) / 4)))
-
-    # G channel -----------------------------------------------------------
-    # known at Gr and Gb; cross-avg at R and B
-    G_interp = (s(0, -1) + s(0, +1) + s(-1, 0) + s(+1, 0)) / 4
-    G = np.where(at_Gr | at_Gb, d, G_interp)
-
-    # B channel -----------------------------------------------------------
-    # known at B; horiz-avg at Gb; vert-avg at Gr; diag-avg at R
+        np.where(at_Gr, (s(0,-1)+s(0,+1))/2,
+        np.where(at_Gb, (s(-1,0)+s(+1,0))/2,
+                        (s(-1,-1)+s(-1,+1)+s(+1,-1)+s(+1,+1))/4)))
+    G = np.where(at_Gr | at_Gb, d, (s(0,-1)+s(0,+1)+s(-1,0)+s(+1,0))/4)
     B = np.where(at_B,  d,
-        np.where(at_Gb, (s(0, -1) + s(0, +1)) / 2,
-        np.where(at_Gr, (s(-1, 0) + s(+1, 0)) / 2,
-                        (s(-1, -1) + s(-1, +1) + s(+1, -1) + s(+1, +1)) / 4)))
-
-    return np.stack([R, G, B], axis=-1)  # (H, W, 3)
+        np.where(at_Gb, (s(0,-1)+s(0,+1))/2,
+        np.where(at_Gr, (s(-1,0)+s(+1,0))/2,
+                        (s(-1,-1)+s(-1,+1)+s(+1,-1)+s(+1,+1))/4)))
+    return np.stack([R, G, B], axis=-1)
 
 
 def _debayer(raw: np.ndarray, pattern: str) -> np.ndarray:
-    """Debayer any supported Bayer pattern → (H, W, 3) float64."""
     pat = pattern.upper().strip()
     if pat not in _BAYER_TO_RGGB_ROLL:
         raise ValueError(f"Unsupported Bayer pattern: {pattern!r}")
     dr, dc = _BAYER_TO_RGGB_ROLL[pat]
-    data = np.roll(raw, (dr, dc), axis=(0, 1))
-    return _debayer_rggb(data)
+    return _debayer_rggb(np.roll(raw, (dr, dc), axis=(0, 1)))
 
 
 # ---------------------------------------------------------------------------
 # Main conversion entry point
 # ---------------------------------------------------------------------------
 
-def fits_data_to_qimage(data: np.ndarray, header=None) -> QImage:
-    """
-    Convert FITS image data to a QImage. Safe to call from any thread.
+def fits_data_to_qimage(data: np.ndarray,
+                        header=None,
+                        vmin: float | None = None,
+                        vmax: float | None = None,
+                        gamma: float = 0.5) -> QImage:
+    """Convert FITS data → QImage. Thread-safe.
 
-    Handles:
-      • 2-D grayscale
-      • 2-D Bayer OSC  (BAYERPAT / COLORTYP keyword in header)
-      • 3-D RGB cube   (3, H, W) or (H, W, 3)
+    With vmin/vmax=None uses per-channel auto-stretch (preload path).
+    With explicit vmin/vmax applies global stretch to all channels.
     """
-    # Squeeze length-1 axes (e.g. (1, H, W) → (H, W))
     data = np.squeeze(data)
 
-    # --- 3-D: already colour ---
     if data.ndim == 3:
         if data.shape[0] == 3:
-            rgb = np.stack([_normalize(data[i]) for i in range(3)], axis=-1)
+            channels = [data[i] for i in range(3)]
         elif data.shape[2] == 3:
-            rgb = np.stack([_normalize(data[:, :, i]) for i in range(3)], axis=-1)
+            channels = [data[:, :, i] for i in range(3)]
         else:
-            return fits_data_to_qimage(data[0], header)
+            return fits_data_to_qimage(data[0], header, vmin, vmax, gamma)
+        rgb = np.stack([_normalize(c, vmin, vmax, gamma) for c in channels], axis=-1)
         return _rgb_to_qimage(np.flipud(rgb))
 
-    # --- 2-D ---
     if data.ndim == 2:
         bayer = None
         if header is not None:
-            bayer = (
-                header.get("BAYERPAT")
-                or header.get("COLORTYP")
-                or header.get("BAYER")
-            )
-
+            bayer = (header.get("BAYERPAT") or
+                     header.get("COLORTYP") or
+                     header.get("BAYER"))
         if bayer and str(bayer).upper().strip() in _BAYER_TO_RGGB_ROLL:
             rgb_f = _debayer(data, str(bayer))
-            rgb = np.stack([_normalize(rgb_f[:, :, i]) for i in range(3)], axis=-1)
+            rgb = np.stack([_normalize(rgb_f[:, :, i], vmin, vmax, gamma)
+                            for i in range(3)], axis=-1)
             return _rgb_to_qimage(np.flipud(rgb))
-
-        return _gray_to_qimage(np.flipud(_normalize(data)))
+        return _gray_to_qimage(np.flipud(_normalize(data, vmin, vmax, gamma)))
 
     raise ValueError(f"Cannot display data with shape {data.shape}")
 
 
-def fits_data_to_pixmap(data: np.ndarray, header=None) -> QPixmap:
-    """Convenience wrapper — must be called from the main thread."""
-    return QPixmap.fromImage(fits_data_to_qimage(data, header))
+def fits_data_to_pixmap(data, header=None, vmin=None, vmax=None, gamma=0.5):
+    return QPixmap.fromImage(fits_data_to_qimage(data, header, vmin, vmax, gamma))
 
 
 def _load_path_as_qimage(path: str) -> QImage | None:
-    """
-    Load a FITS file and return a QImage. Designed to run in a worker thread.
-    Copies array data before the file handle closes so mmap backing is safe.
-    """
+    """Load FITS → QImage with auto-stretch. Runs in worker thread."""
+    t0   = time.perf_counter()
+    name = os.path.basename(path)
     try:
+        t_io = time.perf_counter()
         with fits.open(path) as hdul:
-            hdu = next(
-                (h for h in hdul if h.data is not None and h.data.ndim >= 2),
-                None,
-            )
+            hdu = next((h for h in hdul if h.data is not None
+                        and h.data.ndim >= 2), None)
             if hdu is None:
                 return None
-            data   = hdu.data.copy()   # copy before mmap closes
-            header = hdu.header
-        return fits_data_to_qimage(data, header)
+            data, header = hdu.data.copy(), hdu.header
+        _log.debug("[worker] _load_path_as_qimage: I/O %.1f ms  %s",
+                   (time.perf_counter() - t_io) * 1000, name)
+        t_conv = time.perf_counter()
+        qi = fits_data_to_qimage(data, header)
+        _log.debug("[worker] _load_path_as_qimage: convert %.1f ms  total %.1f ms  %s",
+                   (time.perf_counter() - t_conv) * 1000,
+                   (time.perf_counter() - t0) * 1000, name)
+        return qi
     except Exception:
+        _log.exception("[worker] _load_path_as_qimage failed: %s", name)
         return None
 
 
-# (images_ahead, images_behind) relative to the direction of travel.
-# MISS is used when the user jumped past our preloads — assume they'll keep going.
+def _load_path_raw_data(path: str) -> tuple[np.ndarray, object] | tuple[None, None]:
+    """Load raw array + header for histogram/stretch use. Main-thread only."""
+    t0   = time.perf_counter()
+    name = os.path.basename(path)
+    try:
+        with fits.open(path) as hdul:
+            hdu = next((h for h in hdul if h.data is not None
+                        and h.data.ndim >= 2), None)
+            if hdu is None:
+                return None, None
+            data, header = hdu.data.copy(), hdu.header
+        _log.debug("_load_path_raw_data: %.1f ms  %s",
+                   (time.perf_counter() - t0) * 1000, name)
+        return data, header
+    except Exception:
+        _log.exception("_load_path_raw_data failed: %s", name)
+        return None, None
+
+
+def _extract_wb_multipliers(header) -> tuple[float, float, float] | None:
+    """Try to extract R/G/B white-balance gain multipliers from common FITS keywords.
+
+    Returns (r_gain, g_gain, b_gain) normalised so g_gain == 1.0, or None if no
+    recognised keyword set is found.  Checked keyword triplets (in priority order):
+        RSCALE / GSCALE / BSCALE2   — INDI / KStars capture
+        WB_RED / WB_GREEN / WB_BLUE — some DSO capture tools
+        MULR   / MULG   / MULB      — miscellaneous convention
+    Note: the standard FITS keyword BSCALE encodes data scaling (not blue gain)
+    and is intentionally excluded.
+    """
+    if header is None:
+        return None
+    for r_key, g_key, b_key in [
+        ("RSCALE",  "GSCALE",    "BSCALE2"),
+        ("WB_RED",  "WB_GREEN",  "WB_BLUE"),
+        ("MULR",    "MULG",      "MULB"),
+    ]:
+        try:
+            r = float(header[r_key])
+            g = float(header[g_key])
+            b = float(header[b_key])
+            if g > 0:
+                return r / g, 1.0, b / g      # normalise to green
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None
+
+
+def _build_stretch_data(data: np.ndarray,
+                        header=None) -> tuple[np.ndarray, float, float]:
+    """Pre-process raw FITS data into a uint16 array for fast LUT-based stretch.
+
+    Handles grayscale, Bayer (debayered → colour), and pre-stacked colour.
+    White-balance multipliers are applied to colour arrays when present in the
+    FITS header (see _extract_wb_multipliers).
+    Returns (u16, lo, hi) where u16 is (H, W) or (H, W, 3) already
+    flipped for display, and lo/hi are the data values that map to 0 / 65535.
+    """
+    t0 = time.perf_counter()
+    d = np.squeeze(data).astype(np.float64)
+
+    bayer = None
+    if header is not None:
+        bayer = (header.get("BAYERPAT") or
+                 header.get("COLORTYP") or
+                 header.get("BAYER"))
+
+    if d.ndim == 2 and bayer and str(bayer).upper().strip() in _BAYER_TO_RGGB_ROLL:
+        t_deb = time.perf_counter()
+        d = _debayer(d, str(bayer))           # → (H, W, 3) float64
+        _log.debug("_build_stretch_data: debayer %.1f ms  shape=%s bayer=%s",
+                   (time.perf_counter() - t_deb) * 1000, d.shape, bayer)
+    elif d.ndim == 3:
+        if d.shape[0] == 3:
+            d = np.transpose(d, (1, 2, 0))   # (3, H, W) → (H, W, 3)
+        elif d.shape[2] != 3:
+            d = d[0]                          # unknown cube → first plane
+
+    # Apply white-balance correction on colour arrays
+    if d.ndim == 3:
+        wb = _extract_wb_multipliers(header)
+        if wb is not None:
+            _log.debug("_build_stretch_data: applying WB multipliers R=%.3f B=%.3f", wb[0], wb[2])
+            d = d * np.array(wb, dtype=np.float64)[np.newaxis, np.newaxis, :]
+
+    t_q = time.perf_counter()
+    flat = d.ravel()
+    lo = float(np.nanpercentile(flat, 0.01))
+    hi = float(np.nanpercentile(flat, 99.99))
+    if hi <= lo:
+        hi = lo + 1.0
+
+    u16 = np.clip((d - lo) / (hi - lo) * 65535, 0, 65535).astype(np.uint16)
+    result = np.ascontiguousarray(np.flipud(u16))
+    _log.debug("_build_stretch_data: quantize %.1f ms  total %.1f ms  shape=%s",
+               (time.perf_counter() - t_q) * 1000,
+               (time.perf_counter() - t0) * 1000, result.shape)
+    return result, lo, hi
+
+
+# ---------------------------------------------------------------------------
+# LUT-building helpers for non-linear stretch algorithms
+# ---------------------------------------------------------------------------
+
+def _compute_asinh_lut(stretch_lo: float, stretch_hi: float,
+                        vmin: float, vmax: float,
+                        stretch_factor: float = 5.0) -> np.ndarray:
+    """Build a 65536-entry uint8 LUT for asinh stretch.
+
+    Data is clipped to [vmin, vmax], normalized to [0, 1], then:
+        t' = arcsinh(stretch_factor * t) / arcsinh(stretch_factor)
+    """
+    idx      = np.arange(65536, dtype=np.float64)
+    data_val = stretch_lo + idx / 65535.0 * (stretch_hi - stretch_lo)
+    span     = vmax - vmin if vmax > vmin else 1.0
+    t        = np.clip((data_val - vmin) / span, 0.0, 1.0)
+    if stretch_factor > 0:
+        denom = np.arcsinh(stretch_factor)
+        if denom > 0:
+            t = np.arcsinh(stretch_factor * t) / denom
+    return (np.clip(t, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _compute_zscale_lut(stretch_lo: float, stretch_hi: float,
+                         raw_flat: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Build a uint8 LUT using ZScale limits (returns lut, z1, z2)."""
+    finite = raw_flat[np.isfinite(raw_flat)]
+    z1, z2 = ZScaleInterval().get_limits(finite)
+    span     = z2 - z1 if z2 > z1 else 1.0
+    idx      = np.arange(65536, dtype=np.float64)
+    data_val = stretch_lo + idx / 65535.0 * (stretch_hi - stretch_lo)
+    t        = np.clip((data_val - z1) / span, 0.0, 1.0)
+    return (t * 255.0).astype(np.uint8), float(z1), float(z2)
+
+
+def _mtf_rational(t: np.ndarray, M: float) -> np.ndarray:
+    """PixInsight MTF rational function applied element-wise to t ∈ [0, 1].
+
+        f(0) = 0
+        f(x) = (M−1)·x / ((2M−1)·x − M)   for x > 0
+        f(1) = 1
+
+    M is the midtone-balance parameter: the input value that maps to 0.5.
+    """
+    denom  = (2.0 * M - 1.0) * t - M
+    safe   = np.where(np.abs(denom) < 1e-12, 1.0, denom)
+    result = (M - 1.0) * t / safe
+    return np.where(t == 0.0, 0.0, np.clip(result, 0.0, 1.0))
+
+
+def _mtf_stats(samples: np.ndarray,
+               shadow_clip: float = -2.8) -> tuple[float, float, float]:
+    """Compute MTF black point, normalization span, and midtone-balance M.
+
+    Excludes zero (and near-zero) pixels before computing statistics to avoid
+    the "black border" problem where stacking artifacts drag the median to zero.
+
+    Returns (black, span, M) where:
+        black — value mapping to 0 (shadow clip = median + shadow_clip * MAD,
+                shadow_clip < 0 so black is *below* the sky median)
+        span  — range [black, nonzero_max] used to normalise samples to [0, 1]
+        M     — midtone-balance for _mtf_rational; maps the normalised sky
+                median to target_bkg = 0.25 by solving
+                    MTF(m_norm, M) = 0.25  analytically:
+                    M = 3·m_norm / (2·m_norm + 1)
+                This keeps M in (0, 1) for all m_norm in (0, 1) and
+                ensures the sky background appears at 25% grey, not black.
+    """
+    nonzero = samples[samples > 1e-6 * float(samples.max()) + 1e-9]
+    if nonzero.size < 100:                          # fall back if almost nothing
+        nonzero = samples
+    med   = float(np.median(nonzero))
+    mad   = float(median_abs_deviation(nonzero, scale="normal"))
+    black = med + shadow_clip * mad                 # shadow_clip < 0 → below median
+    span  = float(nonzero.max()) - black
+    if span <= 0:
+        span = 1.0
+    m_norm = float(np.clip((med - black) / span, 1e-9, 1.0 - 1e-9))
+    # Correct M: solve MTF(m_norm, M) = 0.25  →  M = 3·m_norm / (2·m_norm + 1)
+    # (Wrong formula M = 0.25 / m_norm gives M >> 1 for typical m_norm ~ 0.1,
+    #  which maps the sky median to a *negative* value that clips to black.)
+    M = 3.0 * m_norm / (2.0 * m_norm + 1.0)
+    return black, span, M
+
+
+def _compute_mtf_lut(u16_flat: np.ndarray) -> np.ndarray:
+    """Build a 65536-entry uint8 MTF LUT from a flat u16 sample array.
+
+    Used for grayscale images where per-channel split is not applicable.
+    Uses the same span that _mtf_stats used to compute M — essential so the
+    LUT normalization is consistent with the M value.
+    """
+    black, span, M = _mtf_stats(u16_flat.astype(np.float64))
+    _log.debug("_compute_mtf_lut: black=%.1f  span=%.1f  M=%.5f", black, span, M)
+    idx = np.arange(65536, dtype=np.float64)
+    t   = np.clip((idx - black) / span, 0.0, 1.0)
+    return (_mtf_rational(t, M) * 255.0).astype(np.uint8)
+
+
+def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
+    """Per-channel unlinked MTF with luminance-based colour preservation.
+
+    Pipeline
+    --------
+    1. Per-channel statistics (non-zero pixels only — avoids black-border bias).
+       shadow_clip = -2.8 (PixInsight standard; pushes black point 2.8 σ below
+       sky median, preserving faint dust/nebulosity rather than clipping it).
+    2. Per-channel black-point subtraction + normalization to [0, 1] using each
+       channel's own span.  This forces all three backgrounds toward zero,
+       neutralizing skyglow colour casts without a separate WB step.
+    3. Compute per-channel midtone balance M_c such that each channel's
+       normalized sky median maps to target_bkg = 0.25.
+    4. Extract linear luminance Y (Rec.709) from the BG-subtracted, normalised
+       channels BEFORE any MTF is applied.
+    5. Derive a luminance MTF from Y's own sky-median statistics.
+    6. Reconstruct colour: scale every channel by Y_stretched / Y_linear.
+       This preserves star hue in the highlights — a star with R:G:B = 8:4:1
+       stays orange after stretch instead of bloating toward white.
+
+    u16 : (H, W, 3) uint16 — globally quantised linear data
+    Returns (H, W, 3) uint8.
+    """
+    lin = u16.astype(np.float64) / 65535.0   # (H, W, 3), linear [0, 1]
+
+    # ── Per-channel black points and spans (exclude zero / border pixels) ──
+    # _mtf_stats returns the same span used to compute M, so normalization
+    # below and the M value are guaranteed consistent.
+    black = np.zeros(3)
+    span  = np.ones(3)
+    for c in range(3):
+        ch = lin[:, :, c].ravel()
+        b, s, M_c = _mtf_stats(ch)
+        black[c] = b
+        span[c]  = s
+        _log.debug("_apply_mtf_color: ch=%d  black=%.5f  span=%.5f  M=%.5f",
+                   c, b, s, M_c)
+
+    # ── Per-channel BG subtraction + normalisation to [0, 1] ──
+    bg_sub = np.clip(
+        (lin - black[np.newaxis, np.newaxis, :]) / span[np.newaxis, np.newaxis, :],
+        0.0, 1.0,
+    )
+
+    # ── Linear luminance (Rec.709) from the per-channel-normalised data ──
+    # bg_sub is already in [0, 1] with background near 0.  We do NOT call
+    # _mtf_stats on luma_lin because that would perform a second shadow clip
+    # on already-BG-subtracted values, producing wild m_norm estimates.
+    # Instead, derive M_luma directly: the luma background median is now
+    # close to 0 in a [0, 1] range, so span_luma ≈ 1 and
+    #   m_norm_luma ≈ median(luma_lin, nonzero pixels)
+    # Then M = 3·m_norm / (2·m_norm + 1) as normal.
+    luma_lin = (0.2126 * bg_sub[:, :, 0] +
+                0.7152 * bg_sub[:, :, 1] +
+                0.0722 * bg_sub[:, :, 2])
+
+    luma_flat = luma_lin.ravel()
+    luma_pos  = luma_flat[luma_flat > 1e-6]
+    luma_med  = float(np.median(luma_pos)) if luma_pos.size >= 100 else float(np.median(luma_flat))
+    m_norm_luma = float(np.clip(luma_med, 1e-9, 1.0 - 1e-9))
+    M_luma      = 3.0 * m_norm_luma / (2.0 * m_norm_luma + 1.0)
+    _log.debug("_apply_mtf_color: luma_med=%.5f  m_norm=%.5f  M=%.5f",
+               luma_med, m_norm_luma, M_luma)
+    luma_str = _mtf_rational(luma_lin, M_luma)
+
+    # ── Luminance-preserving colour reconstruction ──
+    # safe_luma replaces zero/tiny denominators with 1.0 so np.where's eager
+    # evaluation of luma_str / safe_luma never triggers a divide warning.
+    safe_luma = np.where(luma_lin > 1e-6, luma_lin, 1.0)
+    ratio     = np.where(luma_lin > 1e-6, luma_str / safe_luma, 0.0)
+    result    = np.clip(bg_sub * ratio[:, :, np.newaxis], 0.0, 1.0)
+    return (result * 255.0).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Preload / cache constants
+# ---------------------------------------------------------------------------
+
 _PRELOAD_HIT  = (3, 2)
 _PRELOAD_MISS = (8, 2)
-_POOL_WORKERS = 4           # concurrent background loads
-_CACHE_MAX    = 30          # max QImages held in RAM (~50–300 MB depending on size)
+_POOL_WORKERS = 4
+_CACHE_MAX    = 30
 
 # ---------------------------------------------------------------------------
 # Directory navigation helpers
@@ -200,14 +472,205 @@ _FITS_EXTENSIONS = frozenset({".fits", ".fit", ".fts"})
 
 
 def _fits_siblings(path: str) -> list[str]:
-    """Sorted list of FITS files in the same directory as *path*."""
     directory = os.path.dirname(os.path.abspath(path))
-    siblings = [
+    return sorted(
         os.path.join(directory, name)
         for name in os.listdir(directory)
         if os.path.splitext(name)[1].lower() in _FITS_EXTENSIONS
-    ]
-    return sorted(siblings)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Histogram overlay widget
+# ---------------------------------------------------------------------------
+
+class HistogramOverlay(QWidget):
+    """Semi-transparent histogram with draggable black / mid / white markers."""
+
+    stretch_changed = Signal(float, float, float)   # vmin, gamma, vmax
+
+    W, H      = 300, 92
+    HIST_TOP  = 4
+    HIST_BOT  = 64       # bottom of histogram bar area
+    SEP_Y     = 66       # separator line y
+    TRI_TOP   = SEP_Y    # triangle apex y (touching separator)
+    TRI_BOT   = SEP_Y + 20   # triangle base y
+    TRI_HW    = 7        # triangle half-width
+    MX        = 10       # left/right content margin
+    HIT_R     = 10       # click-detection radius (px)
+
+    # Marker colours
+    _COLORS = {
+        "black": QColor(220, 220, 220),
+        "mid":   QColor(255, 185, 30),
+        "white": QColor(220, 220, 220),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.W, self.H)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+
+        self._log_counts: np.ndarray | None = None
+        self._data_lo = 0.0
+        self._data_hi = 1.0
+        self._vmin  = 0.0
+        self._vmax  = 1.0
+        self._gamma = 0.5
+        self._drag: str | None = None   # 'black' | 'mid' | 'white'
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_data(self, data: np.ndarray,
+                 vmin: float, vmax: float, gamma: float = 0.5):
+        flat = np.squeeze(data).ravel().astype(np.float64)
+        flat = flat[np.isfinite(flat)]
+        if flat.size == 0:
+            return
+        lo = float(np.percentile(flat, 0.1))
+        hi = float(np.percentile(flat, 99.9))
+        if hi == lo:
+            hi = lo + 1.0
+        self._data_lo, self._data_hi = lo, hi
+
+        counts, _ = np.histogram(flat, bins=256, range=(lo, hi))
+        log_c = np.log1p(counts.astype(np.float64))
+        peak  = log_c.max()
+        self._log_counts = log_c / peak if peak > 0 else log_c
+
+        self._vmin, self._vmax, self._gamma = vmin, vmax, gamma
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Coordinate helpers
+    # ------------------------------------------------------------------
+
+    def _content_w(self) -> float:
+        return self.W - 2 * self.MX
+
+    def _data_to_x(self, v: float) -> float:
+        t = (v - self._data_lo) / (self._data_hi - self._data_lo)
+        return self.MX + t * self._content_w()
+
+    def _x_to_data(self, x: float) -> float:
+        t = (x - self.MX) / self._content_w()
+        return self._data_lo + t * (self._data_hi - self._data_lo)
+
+    def _gamma_x(self) -> float:
+        xb = self._data_to_x(self._vmin)
+        xw = self._data_to_x(self._vmax)
+        return xb + self._gamma * (xw - xb)
+
+    def _x_to_gamma(self, x: float) -> float:
+        xb = self._data_to_x(self._vmin)
+        xw = self._data_to_x(self._vmax)
+        if xw <= xb:
+            return 0.5
+        return float(np.clip((x - xb) / (xw - xb), 0.01, 0.99))
+
+    def _nearest_marker(self, x: float) -> str | None:
+        candidates = [
+            ("black", self._data_to_x(self._vmin)),
+            ("mid",   self._gamma_x()),
+            ("white", self._data_to_x(self._vmax)),
+        ]
+        candidates.sort(key=lambda t: abs(x - t[1]))
+        name, mx = candidates[0]
+        return name if abs(x - mx) <= self.HIT_R else None
+
+    # ------------------------------------------------------------------
+    # Painting
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Background
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(18, 18, 18, 210)))
+        p.drawRoundedRect(0, 0, self.W, self.H, 6, 6)
+
+        # Histogram bars
+        if self._log_counts is not None:
+            n   = len(self._log_counts)
+            bw  = self._content_w() / n
+            bar_max_h = self.HIST_BOT - self.HIST_TOP - 2
+            p.setPen(Qt.PenStyle.NoPen)
+            for i, v in enumerate(self._log_counts):
+                bh = int(v * bar_max_h)
+                if bh < 1:
+                    continue
+                bx = int(self.MX + i * bw)
+                p.setBrush(QBrush(QColor(170, 170, 170, 210)))
+                p.drawRect(bx, self.HIST_BOT - bh, max(1, int(bw)), bh)
+
+        # Separator
+        p.setPen(QPen(QColor(75, 75, 75), 1))
+        p.drawLine(self.MX, self.SEP_Y, self.W - self.MX, self.SEP_Y)
+
+        # Markers
+        marker_xs = {
+            "black": self._data_to_x(self._vmin),
+            "mid":   self._gamma_x(),
+            "white": self._data_to_x(self._vmax),
+        }
+        for name, mx in marker_xs.items():
+            col = self._COLORS[name]
+            ix  = int(round(mx))
+
+            # Dashed vertical line through histogram
+            pen = QPen(QColor(col.red(), col.green(), col.blue(), 140), 1,
+                       Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawLine(ix, self.HIST_TOP, ix, self.HIST_BOT)
+
+            # Upward-pointing triangle (apex at SEP_Y, flat base lower)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(col))
+            tri = QPolygon([
+                QPoint(ix,                self.TRI_TOP),
+                QPoint(ix - self.TRI_HW, self.TRI_BOT),
+                QPoint(ix + self.TRI_HW, self.TRI_BOT),
+            ])
+            p.drawPolygon(tri)
+
+        p.end()
+
+    # ------------------------------------------------------------------
+    # Mouse handling
+    # ------------------------------------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag = self._nearest_marker(event.position().x())
+
+    def mouseMoveEvent(self, event):
+        x = event.position().x()
+        if self._drag is None:
+            m = self._nearest_marker(x)
+            self.setCursor(Qt.CursorShape.SizeHorCursor
+                           if m else Qt.CursorShape.ArrowCursor)
+            return
+
+        eps = (self._data_hi - self._data_lo) * 1e-4
+        val = float(np.clip(self._x_to_data(x), self._data_lo, self._data_hi))
+
+        if self._drag == "black":
+            self._vmin = min(val, self._vmax - eps)
+        elif self._drag == "white":
+            self._vmax = max(val, self._vmin + eps)
+        elif self._drag == "mid":
+            self._gamma = self._x_to_gamma(x)
+
+        self.update()
+        self.stretch_changed.emit(self._vmin, self._gamma, self._vmax)
+
+    def mouseReleaseEvent(self, _event):
+        self._drag = None
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +678,12 @@ def _fits_siblings(path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class FitsView(QGraphicsView):
-    def __init__(self, pixmap: QPixmap, saved_viewport=None, parent=None):
-        """
-        saved_viewport: (QTransform, QPointF) to restore, or None to auto-fit.
-        """
+    def __init__(self, qimage: QImage,
+                 raw_data: np.ndarray | None, header,
+                 saved_viewport=None, parent=None):
+        pixmap = QPixmap.fromImage(qimage)
         super().__init__(parent)
+
         scene = QGraphicsScene(self)
         self._item = QGraphicsPixmapItem(pixmap)
         self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
@@ -227,48 +691,220 @@ class FitsView(QGraphicsView):
         self.setScene(scene)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing |
+                            QPainter.RenderHint.SmoothPixmapTransform)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         self._pixmap_size = (pixmap.width(), pixmap.height())
-        self._saved_viewport = saved_viewport   # (QTransform, QPointF) or None
+        self._saved_viewport = saved_viewport
+        self._fit_pending    = False
         self._initial_fit_done = saved_viewport is not None
 
-        # Cmd+0 (Qt maps Ctrl→Cmd on macOS) → 1:1 zoom
+        # Stretch data: pre-quantised uint16 for fast LUT application.
+        # _stretch_u16: (H, W) or (H, W, 3) uint16, already flipped for display.
+        # _stretch_lo/hi: data values mapped to u16 0 / 65535.
+        # _raw_flat: float32 flat view of raw data kept for histogram redraws.
+        t0 = time.perf_counter()
+        if raw_data is not None:
+            self._stretch_u16, self._stretch_lo, self._stretch_hi = \
+                _build_stretch_data(raw_data, header)
+            self._raw_flat = np.squeeze(raw_data).ravel().astype(np.float32)
+            self._vmin  = float(np.nanpercentile(self._raw_flat, 1))
+            self._vmax  = float(np.nanpercentile(self._raw_flat, 99))
+            self._auto_vmin = self._vmin
+            self._auto_vmax = self._vmax
+        else:
+            self._stretch_u16 = None
+            self._raw_flat = None
+            self._stretch_lo, self._stretch_hi = 0.0, 1.0
+            self._vmin, self._vmax = 0.0, 1.0
+            self._auto_vmin, self._auto_vmax = 0.0, 1.0
+        self._gamma = 0.5
+        _log.debug("FitsView.__init__: build_stretch_data %.1f ms",
+                   (time.perf_counter() - t0) * 1000)
+
+        # Histogram overlay — child of the viewport so it stays fixed on screen
+        t_hist = time.perf_counter()
+        self._histogram = HistogramOverlay(self.viewport())
+        if raw_data is not None:
+            self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
+        self._histogram.stretch_changed.connect(self._on_stretch_changed)
+        _log.debug("FitsView.__init__: histogram init %.1f ms",
+                   (time.perf_counter() - t_hist) * 1000)
+
+        # Shortcuts (Ctrl→Cmd on macOS)
         QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_one_to_one)
+        QShortcut(QKeySequence("Ctrl+9"), self, self._fit)
+
+    # ------------------------------------------------------------------
+    # Viewport state (preserved across navigation)
+    # ------------------------------------------------------------------
 
     @property
-    def pixmap_size(self) -> tuple[int, int]:
+    def pixmap_size(self):
         return self._pixmap_size
 
-    def viewport_state(self) -> tuple:
-        """Return (QTransform, center_QPointF, pixmap_size) for later restoration."""
+    def viewport_state(self) -> tuple | None:
+        if self._fit_pending:
+            return None
+        if self._saved_viewport is not None:
+            t, c = self._saved_viewport
+            return (t, c, self._pixmap_size)
         center = self.mapToScene(self.viewport().rect().center())
         return (self.transform(), center, self._pixmap_size)
 
+    def _apply_pending_restore(self):
+        if self._saved_viewport is not None:
+            t, c = self._saved_viewport
+            self._saved_viewport = None
+            self.setTransform(t)
+            self.centerOn(c)
+
     def _fit(self):
-        self.fitInView(self.scene().itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_pending = False
+        self.fitInView(self.scene().itemsBoundingRect(),
+                       Qt.AspectRatioMode.KeepAspectRatio)
 
     def _zoom_one_to_one(self):
+        self._fit_pending = False
         self.resetTransform()
 
     def showEvent(self, event):
         super().showEvent(event)
         if self._saved_viewport is not None:
-            transform, center = self._saved_viewport
-            self._saved_viewport = None
-            QTimer.singleShot(0, lambda: (self.setTransform(transform), self.centerOn(center)))
+            QTimer.singleShot(0, self._apply_pending_restore)
         elif not self._initial_fit_done:
             self._initial_fit_done = True
+            self._fit_pending = True
             QTimer.singleShot(0, self._fit)
+        self._position_histogram()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_histogram()
+
+    # ------------------------------------------------------------------
+    # Histogram position
+    # ------------------------------------------------------------------
+
+    def _position_histogram(self):
+        h = self._histogram
+        vp = self.viewport()
+        margin = 12
+        h.move(margin, vp.height() - h.height() - margin)
+        h.raise_()
+
+    # ------------------------------------------------------------------
+    # Stretch control
+    # ------------------------------------------------------------------
+
+    def _apply_prebuilt_lut(self, lut: np.ndarray):
+        """Apply a pre-built 65536-entry uint8 LUT to the u16 data."""
+        if self._stretch_u16 is None:
+            return
+        t0     = time.perf_counter()
+        result = lut[self._stretch_u16]   # (H,W) or (H,W,3) uint8 — vectorised
+        t_qi   = time.perf_counter()
+        qi     = (_gray_to_qimage(result) if result.ndim == 2
+                  else _rgb_to_qimage(result))
+        t_px   = time.perf_counter()
+        self._item.setPixmap(QPixmap.fromImage(qi))
+        _log.debug("_apply_prebuilt_lut: index %.1f ms  qimage %.1f ms  setPixmap %.1f ms  total %.1f ms",
+                   (t_qi - t0) * 1000, (t_px - t_qi) * 1000,
+                   (time.perf_counter() - t_px) * 1000,
+                   (time.perf_counter() - t0) * 1000)
+
+    def _apply_lut(self, vmin: float, gamma: float, vmax: float):
+        """Build a 65 536-entry LUT and apply it to the pre-quantised u16 data.
+
+        LUT computation is ~65 k ops (negligible); application is a single
+        numpy fancy-index op (vectorised memcopy) — fast regardless of image size.
+        """
+        if self._stretch_u16 is None:
+            return
+        lo, hi = self._stretch_lo, self._stretch_hi
+
+        # Map vmin/vmax from data space → u16 space [0, 65535]
+        scale = hi - lo
+        vmin_u = (vmin - lo) / scale * 65535
+        vmax_u = (vmax - lo) / scale * 65535
+        span   = vmax_u - vmin_u
+
+        idx = np.arange(65536, dtype=np.float64)
+        t   = np.clip((idx - vmin_u) / span if span > 0 else idx * 0.0, 0.0, 1.0)
+        if abs(gamma - 0.5) > 1e-4:
+            g   = float(np.clip(gamma, 1e-6, 1.0 - 1e-6))
+            exp = np.log(0.5) / np.log(g)
+            t   = np.power(np.maximum(t, 0.0), exp)
+        lut = (t * 255.0).astype(np.uint8)
+        self._apply_prebuilt_lut(lut)
+
+    def _on_stretch_changed(self, vmin: float, gamma: float, vmax: float):
+        self._vmin, self._gamma, self._vmax = vmin, gamma, vmax
+        self._apply_lut(vmin, gamma, vmax)
+
+    def auto_stretch(self):
+        """Reset to 1–99 percentile auto-stretch (Cmd+1)."""
+        if self._stretch_u16 is None:
+            return
+        self._vmin  = self._auto_vmin
+        self._vmax  = self._auto_vmax
+        self._gamma = 0.5
+        self._apply_lut(self._vmin, self._gamma, self._vmax)
+        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
+
+    def apply_asinh_stretch(self, stretch_factor: float = 5.0):
+        """Asinh stretch using current black/white points (Cmd+2)."""
+        if self._stretch_u16 is None:
+            return
+        lut = _compute_asinh_lut(self._stretch_lo, self._stretch_hi,
+                                   self._vmin, self._vmax, stretch_factor)
+        self._apply_prebuilt_lut(lut)
+        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+
+    def apply_zscale_stretch(self):
+        """ZScale stretch using astropy ZScaleInterval (Cmd+3)."""
+        if self._stretch_u16 is None or self._raw_flat is None:
+            return
+        lut, z1, z2 = _compute_zscale_lut(self._stretch_lo, self._stretch_hi,
+                                            self._raw_flat)
+        self._vmin, self._vmax, self._gamma = z1, z2, 0.5
+        self._apply_prebuilt_lut(lut)
+        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+
+    def apply_mtf_stretch(self):
+        """MTF auto-stretch (PixInsight-style) (Cmd+4).
+
+        Grayscale: fast LUT path (statistics in u16 space).
+        Colour:    per-channel unlinked background neutralisation +
+                   luminance-preserving rational MTF reconstruction.
+        """
+        if self._stretch_u16 is None:
+            return
+        if self._stretch_u16.ndim == 2:
+            # Grayscale — LUT-based
+            lut = _compute_mtf_lut(self._stretch_u16.ravel())
+            self._apply_prebuilt_lut(lut)
+        else:
+            # Colour — per-channel unlinked, luma-preserving
+            result = _apply_mtf_color(self._stretch_u16)
+            qi = _rgb_to_qimage(result)
+            self._item.setPixmap(QPixmap.fromImage(qi))
+        if self._raw_flat is not None:
+            self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+
+    # ------------------------------------------------------------------
+    # Zoom
+    # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
-        # angleDelta is in eighths of a degree; a mouse wheel notch is 120 units.
-        # Scale continuously so trackpad (many tiny deltas) feels smooth while
-        # a mouse wheel notch still gives a reasonable jump (~15% per notch).
-        delta = event.angleDelta().y()
-        factor = 1.15 ** (delta / 120.0)
+        factor = 1.15 ** (event.angleDelta().y() / 120.0)
         self.scale(factor, factor)
 
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self, fits_path: str | None = None):
@@ -276,20 +912,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FITS Preview")
         self.setGeometry(QApplication.primaryScreen().availableGeometry())
         self._fits_files: list[str] = []
-        self._current_index: int = 0
-        self._nav_direction: int = 1   # +1 = forward, -1 = backward
+        self._current_index: int    = 0
+        self._nav_direction: int    = 1
 
-        # QImage cache: path → QImage, capped at _CACHE_MAX entries (LRU order).
         self._cache: OrderedDict[str, QImage] = OrderedDict()
-        # In-flight preload futures: path → Future[QImage | None]
         self._preload_futures: dict[str, Future] = {}
         self._executor = ThreadPoolExecutor(max_workers=_POOL_WORKERS,
                                             thread_name_prefix="fits-preload")
 
-        # Left/Right navigate siblings; window-level so they fire even when
-        # FitsView has keyboard focus.
+        # Window-level shortcuts (fire even when FitsView has focus)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._navigate(+1))
         QShortcut(QKeySequence(Qt.Key.Key_Left),  self, lambda: self._navigate(-1))
+        QShortcut(QKeySequence("Ctrl+1"),          self, self._auto_stretch)
+        QShortcut(QKeySequence("Ctrl+2"),          self, self._asinh_stretch)
+        QShortcut(QKeySequence("Ctrl+3"),          self, self._zscale_stretch)
+        QShortcut(QKeySequence("Ctrl+4"),          self, self._mtf_stretch)
 
         if fits_path:
             self._load_fits(fits_path)
@@ -307,18 +944,15 @@ class MainWindow(QMainWindow):
             self._cache.popitem(last=False)
 
     def _cache_get(self, path: str) -> QImage | None:
-        """Return cached QImage for *path*, draining a completed future if needed."""
-        # Drain completed future into cache
         future = self._preload_futures.get(path)
         if future is not None and future.done():
             self._preload_futures.pop(path)
             try:
-                result = future.result()
-                if result is not None:
-                    self._cache_put(path, result)
+                r = future.result()
+                if r is not None:
+                    self._cache_put(path, r)
             except Exception:
                 pass
-
         if path in self._cache:
             self._cache.move_to_end(path)
             return self._cache[path]
@@ -329,36 +963,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _trigger_preload(self, ahead: int, behind: int):
-        """
-        Submit background loads for neighbors in the direction of travel.
-
-        *ahead* images are loaded in ``_nav_direction``; *behind* in the
-        opposite direction.  Any in-flight future that is no longer inside
-        the desired window is cancelled so workers stay focused on useful work.
-        """
         if not self._fits_files:
             return
         n = len(self._fits_files)
         d = self._nav_direction
-
         wanted: set[str] = set()
         for i in range(1, ahead + 1):
             wanted.add(self._fits_files[(self._current_index + d * i) % n])
         for i in range(1, behind + 1):
             wanted.add(self._fits_files[(self._current_index - d * i) % n])
-
-        # Cancel futures that fell outside the new window (stale direction /
-        # the user slowed down).  cancel() is a no-op if the task is already
-        # running, but it prevents queued tasks from starting.
         for path in list(self._preload_futures):
             if path not in wanted:
                 self._preload_futures.pop(path).cancel()
-
         for path in wanted:
             if path not in self._cache and path not in self._preload_futures:
                 self._preload_futures[path] = self._executor.submit(
-                    _load_path_as_qimage, path
-                )
+                    _load_path_as_qimage, path)
 
     # ------------------------------------------------------------------
     # Loading
@@ -370,41 +990,54 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(label)
 
     def _load_fits(self, path: str, saved_viewport=None):
+        t0       = time.perf_counter()
         abs_path = os.path.abspath(path)
-        self.setWindowTitle(f"FITS Preview — {os.path.basename(abs_path)}")
+        name     = os.path.basename(abs_path)
+        self.setWindowTitle(f"FITS Preview — {name}")
         try:
-            # --- Check cache / in-flight future ---
-            qimage = self._cache_get(abs_path)
+            # QImage from cache or fresh load
+            qimage    = self._cache_get(abs_path)
             cache_hit = qimage is not None
-
+            _log.debug("_load_fits: cache %s  %s", "HIT" if cache_hit else "MISS", name)
             if qimage is None:
-                # Cache miss: cancel any queued (not-yet-running) future for
-                # this path and load synchronously right now.
                 future = self._preload_futures.pop(abs_path, None)
                 if future is not None:
                     future.cancel()
+                t_qi = time.perf_counter()
                 qimage = _load_path_as_qimage(abs_path)
+                _log.debug("_load_fits: fresh load %.1f ms  %s",
+                           (time.perf_counter() - t_qi) * 1000, name)
                 if qimage is None:
-                    label = QLabel(f"No image data found in:\n{abs_path}")
-                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    self.setCentralWidget(label)
+                    self.setCentralWidget(
+                        QLabel(f"No image data found in:\n{abs_path}"))
                     return
-
             self._cache_put(abs_path, qimage)
-            pixmap = QPixmap.fromImage(qimage)
 
-            # Decide whether to restore the previous viewport (same image size)
-            # or let FitsView auto-fit the new image.
+            # Raw data always loaded for histogram / stretch
+            t_raw = time.perf_counter()
+            raw_data, raw_header = _load_path_raw_data(abs_path)
+            _log.debug("_load_fits: raw_data load %.1f ms  %s",
+                       (time.perf_counter() - t_raw) * 1000, name)
+
+            # Viewport restore
+            pixmap = QPixmap.fromImage(qimage)
             vp_to_restore = None
             if saved_viewport is not None:
                 _, _, old_size = saved_viewport
                 if old_size == (pixmap.width(), pixmap.height()):
                     vp_to_restore = (saved_viewport[0], saved_viewport[1])
 
-            view = FitsView(pixmap, saved_viewport=vp_to_restore)
-            self.setCentralWidget(view)
+            t_view = time.perf_counter()
+            view = FitsView(qimage, raw_data, raw_header,
+                            saved_viewport=vp_to_restore)
+            _log.debug("_load_fits: FitsView() %.1f ms  %s",
+                       (time.perf_counter() - t_view) * 1000, name)
 
-            # Update the sibling file list and current position.
+            t_sw = time.perf_counter()
+            self.setCentralWidget(view)
+            _log.debug("_load_fits: setCentralWidget %.1f ms  %s",
+                       (time.perf_counter() - t_sw) * 1000, name)
+
             self._fits_files = _fits_siblings(abs_path)
             try:
                 self._current_index = self._fits_files.index(abs_path)
@@ -414,24 +1047,45 @@ class MainWindow(QMainWindow):
             ahead, behind = _PRELOAD_HIT if cache_hit else _PRELOAD_MISS
             self._trigger_preload(ahead, behind)
 
+            _log.debug("_load_fits: TOTAL %.1f ms  %s", (time.perf_counter() - t0) * 1000, name)
+
         except Exception as e:
             traceback.print_exc(file=sys.stderr)
-            label = QLabel(f"Error loading file:\n{e}")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.setCentralWidget(label)
+            self.setCentralWidget(QLabel(f"Error loading file:\n{e}"))
 
     def _navigate(self, delta: int):
         if not self._fits_files:
             return
-
-        # Snapshot the current viewport before replacing it.
+        t0 = time.perf_counter()
+        self._nav_direction = 1 if delta > 0 else -1
         saved_vp = None
         view = self.centralWidget()
         if isinstance(view, FitsView):
             saved_vp = view.viewport_state()
-
         self._current_index = (self._current_index + delta) % len(self._fits_files)
+        _log.debug("_navigate: delta=%+d → index %d", delta, self._current_index)
         self._load_fits(self._fits_files[self._current_index], saved_viewport=saved_vp)
+        _log.debug("_navigate: TOTAL %.1f ms", (time.perf_counter() - t0) * 1000)
+
+    def _auto_stretch(self):
+        view = self.centralWidget()
+        if isinstance(view, FitsView):
+            view.auto_stretch()
+
+    def _asinh_stretch(self):
+        view = self.centralWidget()
+        if isinstance(view, FitsView):
+            view.apply_asinh_stretch()
+
+    def _zscale_stretch(self):
+        view = self.centralWidget()
+        if isinstance(view, FitsView):
+            view.apply_zscale_stretch()
+
+    def _mtf_stretch(self):
+        view = self.centralWidget()
+        if isinstance(view, FitsView):
+            view.apply_mtf_stretch()
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +1093,6 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class FitsApp(QApplication):
-    """QApplication subclass that handles macOS QFileOpenEvent (Apple Events)."""
-
     def __init__(self, argv):
         super().__init__(argv)
         self._pending_file: str | None = None
@@ -464,18 +1116,21 @@ class FitsApp(QApplication):
 
 
 def _install_stderr_excepthook():
-    """Print full tracebacks to stderr when running from a terminal."""
     if sys.stderr is None or not sys.stderr.isatty():
         return
-
     def hook(exc_type, exc_value, exc_tb):
         traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
-
     sys.excepthook = hook
 
 
 def main():
     _install_stderr_excepthook()
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
     app = FitsApp(sys.argv)
     fits_path = sys.argv[1] if len(sys.argv) > 1 else None
     window = MainWindow(fits_path)
