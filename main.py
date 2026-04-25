@@ -252,10 +252,38 @@ def _build_stretch_data(data: np.ndarray,
 
     u16 = np.clip((d - lo) / (hi - lo) * 65535, 0, 65535).astype(np.uint16)
     result = np.ascontiguousarray(np.flipud(u16))
-    _log.debug("_build_stretch_data: quantize %.1f ms  total %.1f ms  shape=%s",
-               (time.perf_counter() - t_q) * 1000,
-               (time.perf_counter() - t0) * 1000, result.shape)
-    return result, lo, hi
+    
+    # Fast FWHM geometric estimation (background thread)
+    t_fwhm = time.perf_counter()
+    fwhm = 0.0
+    try:
+        d_plane = d[:, :, 1] if d.ndim == 3 and d.shape[2] == 3 else d[:, :, 0] if d.ndim == 3 else d
+        
+        # We already extracted a random subsample for quantisation logic. 
+        # Use its 99.5th percentile to threshold the full image plane.
+        sub_c = _subsample(d_plane.ravel())
+        if sub_c.size > 0:
+            thresh = float(np.nanpercentile(sub_c, 99.5))
+            mask = (d_plane > thresh).astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            
+            areas = stats[:, cv2.CC_STAT_AREA]
+            valid = (areas > 4) & (areas < 150)
+            valid[0] = False # Ignore vast background blob
+            
+            valid_centroids = centroids[valid]
+            if len(valid_centroids) > 50:
+                valid_centroids = valid_centroids[:50]
+                
+            if len(valid_centroids) > 0:
+                fwhm = compute_backend.estimate_fwhm(d_plane, valid_centroids.astype(np.int32))
+    except Exception as e:
+        _log.error("FWHM estimation failed: %s", e)
+        
+    _log.debug("_build_stretch_data: quantize %.1f ms | fwhm %.2fpx (%.1f ms) | total %.1f ms",
+               (t_fwhm - t_q) * 1000, fwhm, (time.perf_counter() - t_fwhm) * 1000,
+               (time.perf_counter() - t0) * 1000)
+    return result, lo, hi, fwhm
 
 
 # ---------------------------------------------------------------------------
@@ -640,11 +668,12 @@ class _StretchData:
     interactive stretch.  Kept separate from QImage so the two can be cached
     and delivered independently (QImage for immediate display, u16 for controls).
     """
-    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb", "raw_header")
+    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb", "raw_header", "fwhm")
 
     def __init__(self, u16: np.ndarray, lo: float, hi: float,
                  raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None,
-                 mtf_rgb: np.ndarray | None = None, raw_header: dict | None = None):
+                 mtf_rgb: np.ndarray | None = None, raw_header: dict | None = None,
+                 fwhm: float = 0.0):
         self.u16        = u16         # (H, W) or (H, W, 3) uint16, flipped
         self.lo         = lo          # data value → u16 == 0
         self.hi         = hi          # data value → u16 == 65535
@@ -652,6 +681,7 @@ class _StretchData:
         self.mtf_qimage = mtf_qimage  # pre-rendered MTF QImage for instant cache-hit display
         self.mtf_rgb    = mtf_rgb     # raw uint8 array for headless mode
         self.raw_header = raw_header
+        self.fwhm       = fwhm
 
 
 def _compute_from_raw(path: str, raw_data: np.ndarray,
@@ -663,7 +693,7 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
     """
     name = os.path.basename(path)
     t0 = time.perf_counter()
-    u16, lo, hi = _build_stretch_data(raw_data, raw_header)
+    u16, lo, hi, fwhm = _build_stretch_data(raw_data, raw_header)
     raw_flat = _subsample(np.squeeze(raw_data).ravel().astype(np.float32))
     t_mtf = time.perf_counter()
     if u16.ndim == 2:
@@ -679,7 +709,7 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
                (t_mtf - t0) * 1000,
                (time.perf_counter() - t_mtf) * 1000,
                (time.perf_counter() - t0) * 1000, name)
-    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb, dict(raw_header))
+    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb, dict(raw_header), fwhm=fwhm)
 
 import json
 from pathlib import Path
@@ -869,9 +899,31 @@ class MainContainer(QWidget):
         self._histogram = HistogramOverlay(self.view_container)
         self._histogram.setVisible(_config.config.get("histogram_visible", True))
         
+        self._fwhm_gauge = FwhmGaugeOverlay(self.view_container)
+        self._fwhm_tooltip = QLabel(self.view_container)
+        self._fwhm_tooltip.setStyleSheet("color: white; background: rgba(0,0,0,180); border-radius: 4px; padding: 4px; font-size: 11px;")
+        self._fwhm_tooltip.hide()
+        self._fwhm_gauge.hover_changed.connect(self._on_fwhm_hover)
+        
         self.view_container.installEventFilter(self)
         
         self.apply_header_state()
+        
+    def _on_fwhm_hover(self, active: bool):
+        if active:
+            self._fwhm_tooltip.setText(self._fwhm_gauge.get_tooltip_text())
+            self._fwhm_tooltip.adjustSize()
+            gx = self._fwhm_gauge.x()
+            gy = self._fwhm_gauge.y()
+            self._fwhm_tooltip.move(gx - self._fwhm_tooltip.width() - 8,
+                                    gy + self._fwhm_gauge.height() // 2 - self._fwhm_tooltip.height() // 2)
+            self._fwhm_tooltip.show()
+            self._fwhm_tooltip.raise_()
+        else:
+            self._fwhm_tooltip.hide()
+            
+    def update_fwhm_db(self, db, bad, current):
+        self._fwhm_gauge.update_db(db, bad, current)
         
     def set_view(self, view: QWidget, header_data=None):
         if self._current_view:
@@ -892,6 +944,8 @@ class MainContainer(QWidget):
             
         self._gauges.raise_()
         self._histogram.raise_()
+        self._fwhm_gauge.raise_()
+        self._fwhm_tooltip.raise_()
         self.header_panel.update_header(header_data)
         
     def eventFilter(self, obj, event):
@@ -903,6 +957,12 @@ class MainContainer(QWidget):
             
             self._histogram.move(margin, self.view_container.height() - self._histogram.height() - margin)
             self._histogram.raise_()
+            
+            self._fwhm_gauge.move(self.view_container.width() - self._fwhm_gauge.width() - margin, margin)
+            self._fwhm_gauge.raise_()
+            if self._fwhm_tooltip.isVisible():
+                self._on_fwhm_hover(True)
+                self._fwhm_tooltip.raise_()
         return super().eventFilter(obj, event)
 
     def update_gauges(self, back_pct: float, fwd_pct: float):
@@ -1027,6 +1087,81 @@ class BufferGauges(QWidget):
 
         draw_bar(0, self.back_pct)
         draw_bar(w - bar_w, self.fwd_pct)
+
+class FwhmGaugeOverlay(QWidget):
+    """Top-right translucent gauge tracking session FWHMs."""
+    hover_changed = Signal(bool)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(20, 200)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self._db: dict[str, float] = {}
+        self._bad: set[str] = set()
+        self._current_path: str = ""
+        self._valid_fwhms = []
+        self._avg = 0.0
+
+    def update_db(self, db: dict[str, float], bad: set[str], current: str):
+        self._db = db.copy()
+        self._bad = bad.copy()
+        self._current_path = current
+        self._valid_fwhms = [v for k, v in self._db.items() if k not in self._bad and v > 0.0]
+        self._avg = sum(self._valid_fwhms) / len(self._valid_fwhms) if self._valid_fwhms else 0.0
+        self.update()
+
+    def get_tooltip_text(self) -> str:
+        current_val = self._db.get(self._current_path, 0.0)
+        n = len(self._valid_fwhms)
+        return f"FWHM: {current_val:.2f}px | Avg: {self._avg:.2f} (n={n})"
+
+    def enterEvent(self, event):
+        self.hover_changed.emit(True)
+        
+    def leaveEvent(self, event):
+        self.hover_changed.emit(False)
+        
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = self.rect()
+        
+        # Explicitly erase the backing store to prevent alpha accumulation
+        # and "ghosting" when the dynamic scale boundaries change.
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(rect, Qt.GlobalColor.transparent)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(18, 18, 18, 180)))
+        p.drawRoundedRect(rect, 4, 4)
+        
+        if not self._valid_fwhms: return
+            
+        min_f = min(self._valid_fwhms)
+        max_f = max(self._valid_fwhms)
+        if max_f - min_f < 0.01:
+            min_f -= 1.0
+            max_f += 1.0
+            
+        pad = 8
+        draw_h = rect.height() - 2 * pad
+        
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(100, 150, 255, 60)))
+        for val in self._valid_fwhms:
+            t = (val - min_f) / (max_f - min_f)
+            y = rect.height() - pad - int(t * draw_h)
+            p.drawRect(4, y, rect.width() - 8, 2)
+            
+        current_val = self._db.get(self._current_path, 0.0)
+        if current_val > 0.0:
+            t = (current_val - min_f) / (max_f - min_f)
+            t = max(0.0, min(1.0, t))
+            y = rect.height() - pad - int(t * draw_h)
+            p.setBrush(QBrush(QColor(255, 255, 255, 255)))
+            p.drawRect(2, y - 1, rect.width() - 4, 4)
 
 class LoadingWidget(QWidget):
     def __init__(self, parent=None):
@@ -1520,6 +1655,8 @@ class MainWindow(QMainWindow):
         
         self._fits_files: list[str] = []
         self._bad_files: set[str] = set()
+        self._fwhm_db: dict[str, float] = {}
+        self._current_path: str = ""
         self._current_index: int    = 0
         self._nav_direction: int    = 1
         self._current_ahead: int    = 0
@@ -1709,6 +1846,7 @@ class MainWindow(QMainWindow):
         abs_path = os.path.abspath(path)
         name     = os.path.basename(abs_path)
         self.setWindowTitle(f"FITS Preview — {name}")
+        self._current_path = abs_path
         self._stretch_generation += 1
         gen = self._stretch_generation
         try:
@@ -1732,6 +1870,11 @@ class MainWindow(QMainWindow):
                 view = FitsView(stretch.mtf_qimage, stretch,
                                 saved_viewport=vp_to_restore, is_bad=is_bad)
                 self.main_container.set_view(view, stretch.raw_header)
+                if stretch.fwhm > 0.0:
+                    self._fwhm_db[abs_path] = stretch.fwhm
+                if self.main_container is not None:
+                    self.main_container.update_fwhm_db(self._fwhm_db, self._bad_files, self._current_path)
+                    
                 _log.debug("_load_fits: displayed in %.1f ms  [%s]  %s",
                            (time.perf_counter() - t0) * 1000, self._queue_info(), name)
             else:
@@ -1802,6 +1945,12 @@ class MainWindow(QMainWindow):
         is_bad = path in self._bad_files
         view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
         self.main_container.set_view(view, sd.raw_header)
+        
+        if sd.fwhm > 0.0:
+            self._fwhm_db[path] = sd.fwhm
+        if self.main_container is not None:
+            self.main_container.update_fwhm_db(self._fwhm_db, self._bad_files, self._current_path)
+            
         self._update_buffer_gauges()
 
     def _update_buffer_gauges(self):
