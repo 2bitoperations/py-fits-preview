@@ -458,19 +458,12 @@ def _fits_siblings(path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class HistogramOverlay(QWidget):
-    """Semi-transparent histogram with draggable black / mid / white markers."""
+    """Semi-transparent histogram showing active stretch bounds."""
 
-    stretch_changed = Signal(float, float, float)   # vmin, gamma, vmax
-
-    W, H      = 300, 92
+    W, H      = 300, 64
     HIST_TOP  = 4
-    HIST_BOT  = 64       # bottom of histogram bar area
-    SEP_Y     = 66       # separator line y
-    TRI_TOP   = SEP_Y    # triangle apex y (touching separator)
-    TRI_BOT   = SEP_Y + 20   # triangle base y
-    TRI_HW    = 7        # triangle half-width
+    HIST_BOT  = 54       # bottom of histogram bar area
     MX        = 10       # left/right content margin
-    HIT_R     = 10       # click-detection radius (px)
 
     # Marker colours
     _COLORS = {
@@ -483,7 +476,7 @@ class HistogramOverlay(QWidget):
         super().__init__(parent)
         self.setFixedSize(self.W, self.H)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         self._log_counts: np.ndarray | None = None
         self._data_lo = 0.0
@@ -491,7 +484,6 @@ class HistogramOverlay(QWidget):
         self._vmin  = 0.0
         self._vmax  = 1.0
         self._gamma = 0.5
-        self._drag: str | None = None   # 'black' | 'mid' | 'white'
 
     # ------------------------------------------------------------------
     # Public API
@@ -581,10 +573,6 @@ class HistogramOverlay(QWidget):
                 p.setBrush(QBrush(QColor(170, 170, 170, 210)))
                 p.drawRect(bx, self.HIST_BOT - bh, max(1, int(bw)), bh)
 
-        # Separator
-        p.setPen(QPen(QColor(75, 75, 75), 1))
-        p.drawLine(self.MX, self.SEP_Y, self.W - self.MX, self.SEP_Y)
-
         # Markers
         marker_xs = {
             "black": self._data_to_x(self._vmin),
@@ -600,51 +588,6 @@ class HistogramOverlay(QWidget):
                        Qt.PenStyle.DashLine)
             p.setPen(pen)
             p.drawLine(ix, self.HIST_TOP, ix, self.HIST_BOT)
-
-            # Upward-pointing triangle (apex at SEP_Y, flat base lower)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(col))
-            tri = QPolygon([
-                QPoint(ix,                self.TRI_TOP),
-                QPoint(ix - self.TRI_HW, self.TRI_BOT),
-                QPoint(ix + self.TRI_HW, self.TRI_BOT),
-            ])
-            p.drawPolygon(tri)
-
-        p.end()
-
-    # ------------------------------------------------------------------
-    # Mouse handling
-    # ------------------------------------------------------------------
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag = self._nearest_marker(event.position().x())
-
-    def mouseMoveEvent(self, event):
-        x = event.position().x()
-        if self._drag is None:
-            m = self._nearest_marker(x)
-            self.setCursor(Qt.CursorShape.SizeHorCursor
-                           if m else Qt.CursorShape.ArrowCursor)
-            return
-
-        eps = (self._data_hi - self._data_lo) * 1e-4
-        val = float(np.clip(self._x_to_data(x), self._data_lo, self._data_hi))
-
-        if self._drag == "black":
-            self._vmin = min(val, self._vmax - eps)
-        elif self._drag == "white":
-            self._vmax = max(val, self._vmin + eps)
-        elif self._drag == "mid":
-            self._gamma = self._x_to_gamma(x)
-
-        self.update()
-        self.stretch_changed.emit(self._vmin, self._gamma, self._vmax)
-
-    def mouseReleaseEvent(self, _event):
-        self._drag = None
-
 
 # ---------------------------------------------------------------------------
 # Stretch data container
@@ -720,7 +663,8 @@ class ConfigManager:
             "checked_headers": [],
             "preload_ahead": int(allowed * 0.6),
             "preload_behind": int(allowed * 0.15),
-            "cache_max": allowed - int(allowed * 0.6) - int(allowed * 0.15)
+            "cache_max": allowed - int(allowed * 0.6) - int(allowed * 0.15),
+            "histogram_visible": True
         }
         self.load()
 
@@ -857,6 +801,11 @@ class MainContainer(QWidget):
         
         self._current_view = None
         self._gauges = BufferGauges(self.view_container)
+        self._histogram = HistogramOverlay(self.view_container)
+        self._histogram.setVisible(_config.config.get("histogram_visible", True))
+        
+        self.view_container.installEventFilter(self)
+        
         self.apply_header_state()
         
     def set_view(self, view: QWidget, header_data=None):
@@ -866,18 +815,44 @@ class MainContainer(QWidget):
             self._current_view.deleteLater()
         self._current_view = view
         self.view_layout.addWidget(self._current_view)
+        
+        if hasattr(self._current_view, 'stretch_applied'):
+            self._current_view.stretch_applied.connect(self._histogram.set_data)
+            if hasattr(self._current_view, '_raw_flat') and self._current_view._raw_flat is not None:
+                self._histogram.set_data(self._current_view._raw_flat,
+                                         self._current_view._vmin,
+                                         self._current_view._vmax, 0.5)
+            
         self._gauges.raise_()
+        self._histogram.raise_()
         self.header_panel.update_header(header_data)
         
+    def eventFilter(self, obj, event):
+        if obj == self.view_container and event.type() == QEvent.Type.Resize:
+            margin = 12
+            self._gauges.move(self.view_container.width() - self._gauges.width() - margin,
+                              self.view_container.height() - self._gauges.height() - margin)
+            self._gauges.raise_()
+            
+            self._histogram.move(margin, self.view_container.height() - self._histogram.height() - margin)
+            self._histogram.raise_()
+        return super().eventFilter(obj, event)
+
     def update_gauges(self, back_pct: float, fwd_pct: float):
         self._gauges.update_gauges(back_pct, fwd_pct)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        margin = 12
-        self._gauges.move(self.view_container.width() - self._gauges.width() - margin,
-                          self.view_container.height() - self._gauges.height() - margin)
-        self._gauges.raise_()
+        state = _config.config["header_state"]
+        if state == 1:
+            hw = int(self.width() * _config.config["header_width_pct"])
+            self.header_panel.setGeometry(0, 0, hw, self.height())
+
+    def toggle_histogram(self):
+        vis = not self._histogram.isVisible()
+        self._histogram.setVisible(vis)
+        _config.config["histogram_visible"] = vis
+        _config.save()
 
     def get_view(self) -> QWidget:
         return self._current_view
@@ -1007,6 +982,8 @@ class LoadingWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class FitsView(QGraphicsView):
+    stretch_applied = Signal(object, float, float, float)
+
     def __init__(self, qimage: QImage,
                  stretch: _StretchData | None = None,
                  saved_viewport=None, is_bad: bool = False, parent=None):
@@ -1041,10 +1018,6 @@ class FitsView(QGraphicsView):
         self._auto_vmax    = 1.0
         self._gamma        = 0.5
 
-        # Histogram overlay — child of the viewport so it stays fixed on screen
-        self._histogram = HistogramOverlay(self.viewport())
-        self._histogram.stretch_changed.connect(self._on_stretch_changed)
-        
         self._bad_label = QLabel("🤮", self.viewport())
         self._bad_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
         self._bad_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -1078,10 +1051,8 @@ class FitsView(QGraphicsView):
         self._auto_vmax = self._vmax
         _log.debug("FitsView._install_stretch: stats %.1f ms",
                    (time.perf_counter() - t0) * 1000)
-        t_hist = time.perf_counter()
-        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
-        _log.debug("FitsView._install_stretch: histogram %.1f ms",
-                   (time.perf_counter() - t_hist) * 1000)
+        self.stretch_applied.emit(self._raw_flat, self._vmin, self._vmax, 0.5)
+        
         if stretch.mtf_qimage is not None:
             self._item.setPixmap(QPixmap.fromImage(stretch.mtf_qimage))
         else:
@@ -1101,19 +1072,27 @@ class FitsView(QGraphicsView):
 
     def viewport_state(self) -> tuple | None:
         if self._fit_pending:
+            _log.debug("viewport_state: fit_pending is True, returning None")
             return None
         if self._saved_viewport is not None:
             t, c = self._saved_viewport
+            _log.debug("viewport_state: returning cached _saved_viewport")
             return (t, c, self._pixmap_size)
         center = self.mapToScene(self.viewport().rect().center())
+        _log.debug("viewport_state: captured live transform %s and center %s", self.transform(), center)
         return (self.transform(), center, self._pixmap_size)
 
     def _apply_pending_restore(self):
         if self._saved_viewport is not None:
             t, c = self._saved_viewport
+            _log.debug("_apply_pending_restore: applying transform %s and center %s", t, c)
             self._saved_viewport = None
             self.setTransform(t)
+            
+            # centerOn needs the view to have established its viewport geometry,
+            # which happens reliably in resizeEvent.
             self.centerOn(c)
+            self._is_fitted = False
 
     def _fit(self):
         self._fit_pending = False
@@ -1127,9 +1106,7 @@ class FitsView(QGraphicsView):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if self._saved_viewport is not None:
-            QTimer.singleShot(0, self._apply_pending_restore)
-        elif not self._initial_fit_done:
+        if self._saved_viewport is None and not self._initial_fit_done:
             self._initial_fit_done = True
             self._fit_pending = True
             QTimer.singleShot(0, self._fit)
@@ -1137,6 +1114,12 @@ class FitsView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._saved_viewport is not None:
+            # Wait until the view has a non-trivial size from the layout
+            if self.width() > 100 and self.height() > 100:
+                self._apply_pending_restore()
+            return
+
         if self._initial_fit_done and getattr(self, '_is_fitted', False):
             self._fit()
         self._position_overlays()
@@ -1148,10 +1131,6 @@ class FitsView(QGraphicsView):
     def _position_overlays(self):
         vp = self.viewport()
         margin = 12
-        
-        h = self._histogram
-        h.move(margin, vp.height() - h.height() - margin)
-        h.raise_()
         
         font = self._bad_label.font()
         font.setPixelSize(max(24, int(vp.width() * 0.10)))
@@ -1348,6 +1327,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self._commit_bad_files)
         QShortcut(QKeySequence(Qt.Key.Key_Enter),  self, self._commit_bad_files)
         QShortcut(QKeySequence(Qt.Key.Key_I),      self, self.main_container.toggle_header_state)
+        QShortcut(QKeySequence(Qt.Key.Key_H),      self, self.main_container.toggle_histogram)
 
         if fits_path:
             self._load_fits(fits_path)
@@ -1502,6 +1482,9 @@ class MainWindow(QMainWindow):
                     _, _, old_size = saved_viewport
                     if old_size == (pixmap.width(), pixmap.height()):
                         vp_to_restore = (saved_viewport[0], saved_viewport[1])
+                        _log.debug("_load_fits (HIT): matched old size %s, propagating vp_to_restore", old_size)
+                    else:
+                        _log.debug("_load_fits (HIT): size mismatch, discarding saved_viewport")
                 is_bad = abs_path in self._bad_files
                 view = FitsView(stretch.mtf_qimage, stretch,
                                 saved_viewport=vp_to_restore, is_bad=is_bad)
@@ -1567,6 +1550,9 @@ class MainWindow(QMainWindow):
             _, _, old_size = saved_vp
             if old_size == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
                 vp_to_restore = (saved_vp[0], saved_vp[1])
+                _log.debug("_deliver_stretch: matched old size %s, propagating vp_to_restore", old_size)
+            else:
+                _log.debug("_deliver_stretch: size mismatch, discarding saved_viewport")
 
         _log.debug("_deliver_stretch: installing [%s]  %s",
                    self._queue_info(), os.path.basename(path))
@@ -1585,7 +1571,9 @@ class MainWindow(QMainWindow):
             if path in self._stretch_cache:
                 return True
             f = self._preload_futures.get(path)
-            return f is not None and f.done() and f.exception() is None
+            if f is None or not f.done() or f.cancelled():
+                return False
+            return f.exception() is None
             
         idx = self._current_index
         n = len(self._fits_files)
@@ -1625,9 +1613,10 @@ class MainWindow(QMainWindow):
         t0 = time.perf_counter()
         self._nav_direction = 1 if delta > 0 else -1
         saved_vp = None
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if isinstance(view, FitsView):
             saved_vp = view.viewport_state()
+            _log.debug("_navigate: captured saved_vp %s", bool(saved_vp))
         self._current_index = (self._current_index + delta) % len(self._fits_files)
         self._load_fits(self._fits_files[self._current_index], saved_viewport=saved_vp)
         _log.debug("_navigate: TOTAL %.1f ms  [%s]", (time.perf_counter() - t0) * 1000,
