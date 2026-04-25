@@ -1368,6 +1368,10 @@ class MainWindow(QMainWindow):
         # Window-level shortcuts (fire even when FitsView has focus)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._navigate(+1))
         QShortcut(QKeySequence(Qt.Key.Key_Left),  self, lambda: self._navigate(-1))
+        QShortcut(QKeySequence(Qt.Key.Key_Down),  self, lambda: self._navigate(-10))
+        QShortcut(QKeySequence(Qt.Key.Key_Up),    self, lambda: self._navigate(+10))
+        QShortcut(QKeySequence(Qt.Key.Key_Home),  self, lambda: self._navigate(-9999999))
+        QShortcut(QKeySequence(Qt.Key.Key_End),   self, lambda: self._navigate(+9999999))
         QShortcut(QKeySequence("Ctrl+1"),          self, self._mtf_stretch)
         QShortcut(QKeySequence("Ctrl+2"),          self, self._asinh_stretch)
         QShortcut(QKeySequence("Ctrl+3"),          self, self._zscale_stretch)
@@ -1653,10 +1657,18 @@ class MainWindow(QMainWindow):
             return
             
         new_idx = self._current_index + delta
-        if new_idx < 0 or new_idx >= len(self._fits_files):
-            view = self.main_container.get_view()
-            if isinstance(view, FitsView): view.show_eol()
-            return
+        if new_idx < 0:
+            if self._current_index == 0:
+                view = self.main_container.get_view()
+                if isinstance(view, FitsView): view.show_eol()
+                return
+            new_idx = 0
+        elif new_idx >= len(self._fits_files):
+            if self._current_index == len(self._fits_files) - 1:
+                view = self.main_container.get_view()
+                if isinstance(view, FitsView): view.show_eol()
+                return
+            new_idx = len(self._fits_files) - 1
             
         _log.info("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
         t0 = time.perf_counter()
@@ -1666,7 +1678,7 @@ class MainWindow(QMainWindow):
         if isinstance(view, FitsView):
             saved_vp = view.viewport_state()
             _log.debug("_navigate: captured saved_vp %s", bool(saved_vp))
-        self._current_index = (self._current_index + delta) % len(self._fits_files)
+        self._current_index = new_idx
         self._load_fits(self._fits_files[self._current_index], saved_viewport=saved_vp)
         _log.debug("_navigate: TOTAL %.1f ms  [%s]", (time.perf_counter() - t0) * 1000,
                    self._queue_info())

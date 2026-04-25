@@ -16,6 +16,8 @@ FITS Preview bypasses the traditional sluggish FITS viewers by utilizing predict
 | Action | Keybinding |
 | --- | --- |
 | **Next / Previous Image** | `Right Arrow` / `Left Arrow` |
+| **Skip Forward / Back (10 images)** | `Down Arrow` / `Up Arrow` |
+| **First / Last Image** | `Home` / `End` (or `fn + Left` / `fn + Right` on Mac) |
 | **Zoom In / Out** | `Scroll Wheel` |
 | **Pan** | `Click and Drag` |
 | **Zoom to 1:1 Scale** | `Ctrl + 0` (or `Cmd + 0`) |
