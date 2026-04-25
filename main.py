@@ -24,7 +24,7 @@ from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
     QPainter, QColor, QPen, QBrush, QPolygon,
 )
-from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint, QPropertyAnimation
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint, QPropertyAnimation, QRectF
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +568,19 @@ class HistogramOverlay(QWidget):
             p.setPen(pen)
             p.drawLine(ix, self.HIST_TOP, ix, self.HIST_BOT)
 
+        # Labels for min/max boundaries
+        font = p.font()
+        font.setPixelSize(9)
+        p.setFont(font)
+        p.setPen(QColor(170, 170, 170, 255))
+        
+        lo_str = f"{self._data_lo:.1f}" if self._data_lo < 100 else f"{int(self._data_lo)}"
+        p.drawText(self.MX, self.HIST_BOT + 8, lo_str)
+        
+        hi_str = f"{self._data_hi:.1f}" if self._data_hi < 100 else f"{int(self._data_hi)}"
+        hi_w = p.fontMetrics().horizontalAdvance(hi_str)
+        p.drawText(self.W - self.MX - hi_w, self.HIST_BOT + 8, hi_str)
+
 # ---------------------------------------------------------------------------
 # Stretch data container
 # ---------------------------------------------------------------------------
@@ -985,6 +998,58 @@ class LoadingWidget(QWidget):
 # Qt widgets
 # ---------------------------------------------------------------------------
 
+class MagnifierOverlay(QWidget):
+    """Floating magnifying glass overlay showing nearest-neighbor zoomed pixels and raw values."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(160, 160)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._crop = None
+        self._text = ""
+
+    def set_data(self, crop: QPixmap, text: str):
+        self._crop = crop
+        self._text = text
+        self.update()
+
+    def paintEvent(self, event):
+        if self._crop is None or self._crop.isNull():
+            return
+            
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        
+        # Draw the scaled nearest-neighbor crop
+        rect = self.rect()
+        p.drawPixmap(rect, self._crop)
+        
+        # Outer Border
+        p.setPen(QPen(QColor(255, 255, 255, 100), 2))
+        p.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
+        
+        # Center Crosshair
+        cx, cy = rect.width() // 2, rect.height() // 2
+        p.setPen(QPen(QColor(255, 0, 0, 200), 1))
+        p.drawLine(cx, cy - 8, cx, cy + 8)
+        p.drawLine(cx - 8, cy, cx + 8, cy)
+        
+        # Text Readout Background
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(self._text)
+        th = fm.height()
+        
+        text_bg = QRectF(5, rect.height() - th - 10, tw + 10, th + 5)
+        p.setBrush(QColor(0, 0, 0, 180))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(text_bg, 4, 4)
+        
+        # Text Render
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(text_bg, Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
+
+
 class FitsView(QGraphicsView):
     stretch_applied = Signal(object, float, float, float)
 
@@ -1005,6 +1070,12 @@ class FitsView(QGraphicsView):
         self.setRenderHints(QPainter.RenderHint.Antialiasing |
                             QPainter.RenderHint.SmoothPixmapTransform)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # Mouse Tracking & Magnifier
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self._magnifier = MagnifierOverlay(self.viewport())
+        self._magnifier.hide()
 
         self._pixmap_size = (pixmap.width(), pixmap.height())
         self._saved_viewport = saved_viewport
@@ -1309,6 +1380,66 @@ class FitsView(QGraphicsView):
                 
         self._is_fitted = False
         self.scale(factor, factor)
+
+    # ------------------------------------------------------------------
+    # Mouse Interaction (Magnifier)
+    # ------------------------------------------------------------------
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        
+        if self._stretch_u16 is None or self._item is None:
+            return
+            
+        vp_pos = event.position().toPoint()
+        scene_pos = self.mapToScene(vp_pos)
+        
+        x, y = int(scene_pos.x()), int(scene_pos.y())
+        h, w = self._stretch_u16.shape[:2]
+        
+        if 0 <= x < w and 0 <= y < h:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            
+            # Fetch raw pixel data
+            if self._stretch_u16.ndim == 2:
+                val = self._stretch_u16[y, x]
+                text = f"Val: {val}"
+            else:
+                r, g, b = self._stretch_u16[y, x]
+                text = f"R:{r} G:{g} B:{b}"
+                
+            # Crop tiny 15x15 region (viewport handles bounding limits safely)
+            crop_size = 15
+            rx = max(0, x - crop_size // 2)
+            ry = max(0, y - crop_size // 2)
+            rw = min(w - rx, crop_size)
+            rh = min(h - ry, crop_size)
+            
+            crop = self._item.pixmap().copy(rx, ry, rw, rh)
+            self._magnifier.set_data(crop, text)
+            
+            # Position logic (dodge the mouse slightly)
+            mag_w = self._magnifier.width()
+            mag_h = self._magnifier.height()
+            vx = vp_pos.x() + 16
+            vy = vp_pos.y() + 16
+            
+            if vx + mag_w > self.viewport().width():
+                vx = vp_pos.x() - mag_w - 16
+            if vy + mag_h > self.viewport().height():
+                vy = vp_pos.y() - mag_h - 16
+                
+            self._magnifier.move(vx, vy)
+            self._magnifier.show()
+            self._magnifier.raise_()
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self._magnifier.hide()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if hasattr(self, '_magnifier'):
+            self._magnifier.hide()
 
 
 # ---------------------------------------------------------------------------
