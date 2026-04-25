@@ -5,6 +5,7 @@ import time
 import traceback
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
+import cv2
 import numpy as np
 
 _log = logging.getLogger(__name__)
@@ -68,47 +69,38 @@ def _rgb_to_qimage(rgb: np.ndarray) -> QImage:
 # Bayer demosaicing
 # ---------------------------------------------------------------------------
 
-_BAYER_TO_RGGB_ROLL: dict[str, tuple[int, int]] = {
-    "RGGB": (0,  0),
-    "BGGR": (-1, -1),
-    "GRBG": (0,  -1),
-    "GBRG": (-1,  0),
+# OpenCV Bayer → BGR conversion codes.
+#
+# WARNING: OpenCV's Bayer codes are notoriously misnamed due to historical
+# internal representations. The code named `COLOR_BAYER_BG2BGR` actually
+# expects an `RGGB` pattern, and `COLOR_BAYER_RG2BGR` expects `BGGR`.
+# If mapped naively by name, Red and Blue channels are swapped, creating
+# a cyan cast in the final image.
+#
+# Mapping: FITS BAYERPAT value → OpenCV 2BGR code that correctly reads it.
+_BAYER_CV2_CODE: dict[str, int] = {
+    "RGGB": cv2.COLOR_BAYER_BG2BGR,
+    "BGGR": cv2.COLOR_BAYER_RG2BGR,
+    "GRBG": cv2.COLOR_BAYER_GB2BGR,
+    "GBRG": cv2.COLOR_BAYER_GR2BGR,
 }
 
 
-def _debayer_rggb(raw: np.ndarray) -> np.ndarray:
-    """Bilinear demosaicing of a 2-D RGGB array → (H, W, 3) float32."""
-    h, w = raw.shape
-    d = raw.astype(np.float32)
-    p = np.pad(d, 2, mode="reflect")
-
-    def s(dr, dc):
-        return p[2 + dr: 2 + dr + h, 2 + dc: 2 + dc + w]
-
-    rr, cc = np.mgrid[0:h, 0:w]
-    at_R  = (rr % 2 == 0) & (cc % 2 == 0)
-    at_Gr = (rr % 2 == 0) & (cc % 2 == 1)
-    at_Gb = (rr % 2 == 1) & (cc % 2 == 0)
-    at_B  = (rr % 2 == 1) & (cc % 2 == 1)
-
-    R = np.where(at_R,  d,
-        np.where(at_Gr, (s(0,-1)+s(0,+1))/2,
-        np.where(at_Gb, (s(-1,0)+s(+1,0))/2,
-                        (s(-1,-1)+s(-1,+1)+s(+1,-1)+s(+1,+1))/4)))
-    G = np.where(at_Gr | at_Gb, d, (s(0,-1)+s(0,+1)+s(-1,0)+s(+1,0))/4)
-    B = np.where(at_B,  d,
-        np.where(at_Gb, (s(0,-1)+s(0,+1))/2,
-        np.where(at_Gr, (s(-1,0)+s(+1,0))/2,
-                        (s(-1,-1)+s(-1,+1)+s(+1,-1)+s(+1,+1))/4)))
-    return np.stack([R, G, B], axis=-1)
-
-
 def _debayer(raw: np.ndarray, pattern: str) -> np.ndarray:
+    """Demosaic a 2-D Bayer array → (H, W, 3) float32 via OpenCV.
+
+    Accepts any numeric dtype; non-uint16 input is clipped to [0, 65535]
+    and cast to uint16 before passing to cv2 (which requires u8 or u16).
+    Output is RGB (channel 0 = R) — OpenCV produces BGR; we flip here.
+    """
     pat = pattern.upper().strip()
-    if pat not in _BAYER_TO_RGGB_ROLL:
+    code = _BAYER_CV2_CODE.get(pat)
+    if code is None:
         raise ValueError(f"Unsupported Bayer pattern: {pattern!r}")
-    dr, dc = _BAYER_TO_RGGB_ROLL[pat]
-    return _debayer_rggb(np.roll(raw, (dr, dc), axis=(0, 1)))
+    if raw.dtype != np.uint16:
+        raw = np.clip(raw, 0, 65535).astype(np.uint16)
+    bgr = cv2.cvtColor(raw, code)
+    return np.ascontiguousarray(bgr[:, :, ::-1]).astype(np.float32)  # BGR → RGB
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +135,7 @@ def fits_data_to_qimage(data: np.ndarray,
             bayer = (header.get("BAYERPAT") or
                      header.get("COLORTYP") or
                      header.get("BAYER"))
-        if bayer and str(bayer).upper().strip() in _BAYER_TO_RGGB_ROLL:
+        if bayer and str(bayer).upper().strip() in _BAYER_CV2_CODE:
             rgb_f = _debayer(data, str(bayer))
             rgb = np.stack([_normalize(rgb_f[:, :, i], vmin, vmax, gamma)
                             for i in range(3)], axis=-1)
@@ -217,7 +209,7 @@ def _build_stretch_data(data: np.ndarray,
     flipped for display, and lo/hi are the data values that map to 0 / 65535.
     """
     t0 = time.perf_counter()
-    d = np.squeeze(data).astype(np.float32)
+    raw = np.squeeze(data)
 
     bayer = None
     if header is not None:
@@ -225,16 +217,20 @@ def _build_stretch_data(data: np.ndarray,
                  header.get("COLORTYP") or
                  header.get("BAYER"))
 
-    if d.ndim == 2 and bayer and str(bayer).upper().strip() in _BAYER_TO_RGGB_ROLL:
+    if raw.ndim == 2 and bayer and str(bayer).upper().strip() in _BAYER_CV2_CODE:
         t_deb = time.perf_counter()
-        d = _debayer(d, str(bayer))           # → (H, W, 3) float64
+        # Pass the original (non-float) array; _debayer converts to uint16 for OpenCV.
+        d = _debayer(raw, str(bayer))         # → (H, W, 3) float32
         _log.debug("_build_stretch_data: debayer %.1f ms  shape=%s bayer=%s",
                    (time.perf_counter() - t_deb) * 1000, d.shape, bayer)
-    elif d.ndim == 3:
+    elif raw.ndim == 3:
+        d = raw.astype(np.float32)
         if d.shape[0] == 3:
             d = np.transpose(d, (1, 2, 0))   # (3, H, W) → (H, W, 3)
         elif d.shape[2] != 3:
             d = d[0]                          # unknown cube → first plane
+    else:
+        d = raw.astype(np.float32)            # 2-D grayscale, no bayer
 
     # Apply white-balance correction on colour arrays
     if d.ndim == 3:
@@ -244,9 +240,9 @@ def _build_stretch_data(data: np.ndarray,
             d = d * np.array(wb, dtype=np.float64)[np.newaxis, np.newaxis, :]
 
     t_q = time.perf_counter()
-    flat = d.ravel()
-    lo = float(np.nanpercentile(flat, 0.01))
-    hi = float(np.nanpercentile(flat, 99.99))
+    sub = _subsample(d.ravel())
+    lo = float(np.nanpercentile(sub, 0.01))
+    hi = float(np.nanpercentile(sub, 99.99))
     if hi <= lo:
         hi = lo + 1.0
 
@@ -1039,8 +1035,12 @@ class MainWindow(QMainWindow):
                     pass
                 return
             _log.debug("[io] done → compute  %s", name)
-            compute_future = self._compute_executor.submit(
-                _compute_from_raw, path, raw_data, raw_header)
+            try:
+                compute_future = self._compute_executor.submit(
+                    _compute_from_raw, path, raw_data, raw_header)
+            except RuntimeError:
+                # Executor already shut down (app quitting); discard quietly.
+                return
             compute_future.add_done_callback(_on_compute_done)
 
         def _on_compute_done(compute_future):
@@ -1239,6 +1239,15 @@ class MainWindow(QMainWindow):
         if isinstance(view, FitsView):
             view.apply_mtf_stretch()
 
+    def _shutdown(self):
+        """Cancel pending work and stop executor threads immediately on quit."""
+        _log.debug("shutdown: cancelling %d preload futures", len(self._preload_futures))
+        for f in self._preload_futures.values():
+            f.cancel()
+        self._preload_futures.clear()
+        self._io_executor.shutdown(wait=False, cancel_futures=True)
+        self._compute_executor.shutdown(wait=False, cancel_futures=True)
+
 
 # ---------------------------------------------------------------------------
 # Application
@@ -1286,6 +1295,7 @@ def main():
     app = FitsApp(sys.argv)
     fits_path = sys.argv[1] if len(sys.argv) > 1 else None
     window = MainWindow(fits_path)
+    app.aboutToQuit.connect(window._shutdown)
     app.set_main_window(window)
     window.show()
     sys.exit(app.exec())
