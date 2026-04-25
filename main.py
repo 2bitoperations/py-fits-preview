@@ -4,7 +4,6 @@ import sys
 import time
 import traceback
 import argparse
-import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 import cv2
@@ -164,7 +163,8 @@ def _load_path_raw_data(path: str) -> tuple[np.ndarray, object] | tuple[None, No
                         and h.data.ndim >= 2), None)
             if hdu is None:
                 return None, None
-            data, header = hdu.data.copy(), hdu.header
+            # Do NOT use .copy(); returning a view allows astropy to use mmap
+            data, header = hdu.data, hdu.header
         _log.debug("_load_path_raw_data: %.1f ms  %s",
                    (time.perf_counter() - t0) * 1000, name)
         return data, header
@@ -192,11 +192,11 @@ def _extract_wb_multipliers(header) -> tuple[float, float, float] | None:
         ("MULR",    "MULG",      "MULB"),
     ]:
         try:
-            r = float(header[r_key])
-            g = float(header[g_key])
-            b = float(header[b_key])
-            if g > 0:
-                return r / g, 1.0, b / g      # normalise to green
+            r = np.asarray(header[r_key]).item()
+            g = np.asarray(header[g_key]).item()
+            b = np.asarray(header[b_key]).item()
+            if isinstance(g, (int, float)) and g > 0:
+                return float(r) / float(g), 1.0, float(b) / float(g)
         except (KeyError, TypeError, ValueError):
             pass
     return None
@@ -368,10 +368,9 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
     # ── Subsample for statistics gathering (avoids full array allocation) ──
     H, W, C = u16.shape
     N = H * W
-    rng = np.random.default_rng(0)
     
     if N > _SUBSAMPLE_N:
-        idx = rng.choice(N, size=_SUBSAMPLE_N, replace=False)
+        idx = _GLOBAL_RNG.choice(N, size=_SUBSAMPLE_N, replace=False)
         u16_flat = u16.reshape(-1, 3)
         sub_u16 = u16_flat[idx]
     else:
@@ -416,6 +415,7 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
 
 _COMPUTE_WORKERS   = 4          # CPU workers for debayer + quantize + MTF
 _SUBSAMPLE_N       = 500_000    # pixels used for median/MAD/histogram stats
+_GLOBAL_RNG        = np.random.default_rng(0)
 
 
 def _subsample(arr: np.ndarray, n: int = _SUBSAMPLE_N) -> np.ndarray:
@@ -428,8 +428,7 @@ def _subsample(arr: np.ndarray, n: int = _SUBSAMPLE_N) -> np.ndarray:
     flat = arr.ravel()
     if flat.size <= n:
         return flat
-    rng = np.random.default_rng(0)   # fixed seed → reproducible stretch
-    return rng.choice(flat, size=n, replace=False)
+    return _GLOBAL_RNG.choice(flat, size=n, replace=False)
 
 # ---------------------------------------------------------------------------
 # Directory navigation helpers
@@ -520,31 +519,10 @@ class HistogramOverlay(QWidget):
         t = (v - self._data_lo) / (self._data_hi - self._data_lo)
         return self.MX + t * self._content_w()
 
-    def _x_to_data(self, x: float) -> float:
-        t = (x - self.MX) / self._content_w()
-        return self._data_lo + t * (self._data_hi - self._data_lo)
-
     def _gamma_x(self) -> float:
         xb = self._data_to_x(self._vmin)
         xw = self._data_to_x(self._vmax)
         return xb + self._gamma * (xw - xb)
-
-    def _x_to_gamma(self, x: float) -> float:
-        xb = self._data_to_x(self._vmin)
-        xw = self._data_to_x(self._vmax)
-        if xw <= xb:
-            return 0.5
-        return float(np.clip((x - xb) / (xw - xb), 0.01, 0.99))
-
-    def _nearest_marker(self, x: float) -> str | None:
-        candidates = [
-            ("black", self._data_to_x(self._vmin)),
-            ("mid",   self._gamma_x()),
-            ("white", self._data_to_x(self._vmax)),
-        ]
-        candidates.sort(key=lambda t: abs(x - t[1]))
-        name, mx = candidates[0]
-        return name if abs(x - mx) <= self.HIT_R else None
 
     # ------------------------------------------------------------------
     # Painting
@@ -812,6 +790,8 @@ class MainContainer(QWidget):
         if self._current_view:
             self.view_layout.removeWidget(self._current_view)
             self._current_view.setParent(None)
+            if hasattr(self._current_view, 'teardown'):
+                self._current_view.teardown()
             self._current_view.deleteLater()
         self._current_view = view
         self.view_layout.addWidget(self._current_view)
@@ -1036,6 +1016,14 @@ class FitsView(QGraphicsView):
         # Shortcuts (Ctrl→Cmd on macOS)
         QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_one_to_one)
         QShortcut(QKeySequence("Ctrl+9"), self, self._fit)
+
+    def teardown(self):
+        """Clean up QGraphicsScene and explicitly release the pixmap memory."""
+        if self.scene() is not None:
+            self.scene().clear()
+        self._item = None
+        self._stretch_u16 = None
+        self._raw_flat = None
 
     def _install_stretch(self, stretch: _StretchData):
         """Apply a _StretchData object — called at init time or asynchronously."""

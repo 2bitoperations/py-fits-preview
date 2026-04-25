@@ -21,6 +21,7 @@ osacompile -o "$APP_DIR" -e 'on open theFiles' \
 PLIST="$APP_DIR/Contents/Info.plist"
 
 # Use PlistBuddy to inject the DocumentTypes dictionary
+/usr/libexec/PlistBuddy -c "Delete :CFBundleDocumentTypes" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0 dict" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "$PLIST"
