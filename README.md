@@ -44,6 +44,12 @@ You can manually override the RAM-computed buffer queues using CLI arguments:
 uv run python3 main.py --ahead 10 --behind 2 --cache 15 /path/to/image.fits
 ```
 
+## Prerequisites
+
+You must have `uv` installed to manage the environment and launch the application. You can install it using the following 1-liners:
+- **macOS / Linux**: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Windows**: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+
 ## OS Integration (Set as Default Viewer)
 
 You can install FITS Preview as the default double-click handler for `.fit` and `.fits` files natively in your operating system.
@@ -53,6 +59,9 @@ Run `./install_mac.sh`. This generates an AppleScript Application Wrapper inside
 
 **Linux (GNOME / KDE)**:
 Run `./install_linux.sh`. This generates a `py-fits-preview.desktop` shortcut inside `~/.local/share/applications` and updates your XDG mime database so your file manager natively knows to route FITS documents to the pipeline.
+
+**Windows 11**:
+Double click `install_windows.bat`. This automatically updates your User Registry (`HKCU\Software\Classes`) to map `.fits` files to execute `uv run` within the repository directory.
 
 ## License
 

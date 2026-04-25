@@ -624,11 +624,34 @@ import os
 
 class ConfigManager:
     def __init__(self):
-        self.config_path = Path.home() / ".config" / "py-fits-preview.conf"
+        if sys.platform == "win32":
+            config_dir = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "py-fits-preview"
+        else:
+            config_dir = Path.home() / ".config"
+        self.config_path = config_dir / "py-fits-preview.conf"
         
         try:
-            ram_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-        except (AttributeError, ValueError):
+            if sys.platform == "win32":
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                ram_bytes = stat.ullTotalPhys
+            else:
+                ram_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        except Exception:
             ram_bytes = 16 * 1024**3
         
         allowed = int((ram_bytes * 0.10) / (121 * 1024**2))
