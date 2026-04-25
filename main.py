@@ -17,13 +17,13 @@ from scipy.stats import median_abs_deviation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QSizePolicy, QWidget,
-    QVBoxLayout, QProgressBar,
+    QVBoxLayout, QProgressBar, QGraphicsOpacityEffect,
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
     QPainter, QColor, QPen, QBrush, QPolygon,
 )
-from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint, QPropertyAnimation
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +697,59 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
                (time.perf_counter() - t0) * 1000, name)
     return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb)
 
+class BufferGauges(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.back_pct = 0.0
+        self.fwd_pct = 0.0
+        
+        self._eff = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._eff)
+        self._eff.setOpacity(0.9)
+        self._anim = QPropertyAnimation(self._eff, b"opacity")
+        self._anim.setDuration(500)
+        self._is_fading_out = False
+
+    def update_gauges(self, back_pct: float, fwd_pct: float):
+        self.back_pct = back_pct
+        self.fwd_pct = fwd_pct
+        self.update()
+        
+        is_full = (self.back_pct >= 0.99) and (self.fwd_pct >= 0.99)
+        if is_full and not self._is_fading_out and self._eff.opacity() > 0.0:
+            self._anim.stop()
+            self._anim.setStartValue(self._eff.opacity())
+            self._anim.setEndValue(0.0)
+            self._anim.start()
+            self._is_fading_out = True
+        elif not is_full and (self._is_fading_out or self._eff.opacity() < 0.9):
+            self._anim.stop()
+            self._anim.setStartValue(self._eff.opacity())
+            self._anim.setEndValue(0.9)
+            self._anim.start()
+            self._is_fading_out = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bar_w = int(w * 0.4)
+        
+        def draw_bar(x, pct):
+            painter.setPen(QPen(Qt.GlobalColor.white, 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(x, 0, bar_w, h - 1)
+            
+            color = QColor.fromHsv(int(pct * 120), 200, 200)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            fill_h = int((h - 2) * pct)
+            painter.drawRect(x + 1, h - 1 - fill_h, bar_w - 1, fill_h)
+
+        draw_bar(0, self.back_pct)
+        draw_bar(w - bar_w, self.fwd_pct)
+
 class LoadingWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -759,6 +812,15 @@ class FitsView(QGraphicsView):
         self._bad_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._bad_label.setStyleSheet("color: white; background: transparent;")
         self._bad_label.setVisible(is_bad)
+
+        self._eol_label = QLabel("🛑", self.viewport())
+        self._eol_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._eol_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._eol_label.setStyleSheet("color: white; background: transparent;")
+        self._eol_label.setVisible(False)
+        
+        self._gauges = BufferGauges(self.viewport())
+        self._gauges.resize(20, 60)
 
         if stretch is not None:
             self._install_stretch(stretch)
@@ -860,8 +922,34 @@ class FitsView(QGraphicsView):
         self._bad_label.move(vp.width() - self._bad_label.width() - margin, margin)
         self._bad_label.raise_()
         
+        font_eol = self._eol_label.font()
+        font_eol.setPixelSize(max(24, int(vp.width() * 0.10)))
+        self._eol_label.setFont(font_eol)
+        self._eol_label.adjustSize()
+        self._eol_label.move(margin, margin)
+        self._eol_label.raise_()
+        
+        self._gauges.move(vp.width() - self._gauges.width() - margin, vp.height() - self._gauges.height() - margin)
+        self._gauges.raise_()
+        
     def set_bad(self, is_bad: bool):
         self._bad_label.setVisible(is_bad)
+
+    def show_eol(self):
+        self._eol_label.setVisible(True)
+        if hasattr(self, '_eol_anim') and self._eol_anim.state() == QPropertyAnimation.State.Running:
+            self._eol_anim.stop()
+        self._eol_eff = QGraphicsOpacityEffect(self._eol_label)
+        self._eol_label.setGraphicsEffect(self._eol_eff)
+        self._eol_anim = QPropertyAnimation(self._eol_eff, b"opacity")
+        self._eol_anim.setDuration(1000)
+        self._eol_anim.setStartValue(1.0)
+        self._eol_anim.setEndValue(0.0)
+        self._eol_anim.finished.connect(lambda: self._eol_label.setVisible(False))
+        self._eol_anim.start(QPropertyAnimation.DeletionPolicy.KeepWhenStopped)
+
+    def update_gauges(self, back_pct: float, fwd_pct: float):
+        self._gauges.update_gauges(back_pct, fwd_pct)
 
     # ------------------------------------------------------------------
     # Stretch control
@@ -1133,7 +1221,44 @@ class MainWindow(QMainWindow):
                 self._preload_futures.pop(path).cancel()
         for path in wanted:
             if path not in self._stretch_cache and path not in self._preload_futures:
-                self._preload_futures[path] = self._start_pipeline(path)
+                future = self._start_pipeline(path)
+                future.add_done_callback(lambda f: QTimer.singleShot(0, self._update_buffer_gauges))
+                self._preload_futures[path] = future
+
+    def _update_buffer_gauges(self):
+        view = self.centralWidget()
+        if not isinstance(view, FitsView): return
+        
+        if not self._fits_files:
+            view.update_gauges(1.0, 1.0)
+            return
+            
+        def is_buffered(path: str) -> bool:
+            if path in self._stretch_cache:
+                return True
+            f = self._preload_futures.get(path)
+            return f is not None and f.done() and f.exception() is None
+            
+        idx = self._current_index
+        n = len(self._fits_files)
+        
+        back_count = back_expected = 0
+        for i in range(1, _PRELOAD_AHEAD + 1):
+            if idx - i >= 0:
+                back_expected += 1
+                if is_buffered(self._fits_files[idx - i]):
+                    back_count += 1
+                    
+        fwd_count = fwd_expected = 0
+        for i in range(1, _PRELOAD_AHEAD + 1):
+            if idx + i < n:
+                fwd_expected += 1
+                if is_buffered(self._fits_files[idx + i]):
+                    fwd_count += 1
+                    
+        back_pct = 1.0 if back_expected == 0 else back_count / back_expected
+        fwd_pct = 1.0 if fwd_expected == 0 else fwd_count / fwd_expected
+        view.update_gauges(back_pct, fwd_pct)
 
     # ------------------------------------------------------------------
     # Loading
@@ -1230,10 +1355,47 @@ class MainWindow(QMainWindow):
         is_bad = path in self._bad_files
         view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
         self.setCentralWidget(view)
+        self._update_buffer_gauges()
+
+    def _update_buffer_gauges(self):
+        view = self.centralWidget()
+        if not isinstance(view, FitsView): return
+        
+        if not self._fits_files:
+            view.update_gauges(1.0, 1.0)
+            return
+            
+        idx = self._current_index
+        n = len(self._fits_files)
+        
+        back_count = back_expected = 0
+        for i in range(1, _PRELOAD_AHEAD + 1):
+            if idx - i >= 0:
+                back_expected += 1
+                if self._fits_files[idx - i] in self._stretch_cache:
+                    back_count += 1
+                    
+        fwd_count = fwd_expected = 0
+        for i in range(1, _PRELOAD_AHEAD + 1):
+            if idx + i < n:
+                fwd_expected += 1
+                if self._fits_files[idx + i] in self._stretch_cache:
+                    fwd_count += 1
+                    
+        back_pct = 1.0 if back_expected == 0 else back_count / back_expected
+        fwd_pct = 1.0 if fwd_expected == 0 else fwd_count / fwd_expected
+        view.update_gauges(back_pct, fwd_pct)
 
     def _navigate(self, delta: int):
         if not self._fits_files:
             return
+            
+        new_idx = self._current_index + delta
+        if new_idx < 0 or new_idx >= len(self._fits_files):
+            view = self.centralWidget()
+            if isinstance(view, FitsView): view.show_eol()
+            return
+            
         _log.info("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
         t0 = time.perf_counter()
         self._nav_direction = 1 if delta > 0 else -1
