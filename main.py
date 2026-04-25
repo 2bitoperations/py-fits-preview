@@ -245,9 +245,8 @@ def _build_stretch_data(data: np.ndarray,
             d = d * np.array(wb, dtype=np.float64)[np.newaxis, np.newaxis, :]
 
     t_q = time.perf_counter()
-    sub = _subsample(d.ravel())
-    lo = float(np.nanpercentile(sub, 0.01))
-    hi = float(np.nanpercentile(sub, 99.99))
+    lo = float(np.min(d))
+    hi = float(np.max(d))
     if hi <= lo:
         hi = lo + 1.0
 
@@ -460,9 +459,11 @@ def _fits_siblings(path: str) -> list[str]:
 class HistogramOverlay(QWidget):
     """Semi-transparent histogram showing active stretch bounds."""
 
-    W, H      = 300, 64
+    W, H      = 300, 84
     HIST_TOP  = 4
-    HIST_BOT  = 54       # bottom of histogram bar area
+    HIST_BOT  = 54       # bottom of primary histogram bar area
+    FULL_TOP  = 66       # top of full-range histogram
+    FULL_BOT  = 78       # bottom of full-range histogram
     MX        = 10       # left/right content margin
 
     # Marker colours
@@ -479,8 +480,13 @@ class HistogramOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         self._log_counts: np.ndarray | None = None
+        self._full_log_counts: np.ndarray | None = None
+        
         self._data_lo = 0.0
         self._data_hi = 1.0
+        self._abs_lo  = 0.0
+        self._abs_hi  = 1.0
+        
         self._vmin  = 0.0
         self._vmax  = 1.0
         self._gamma = 0.5
@@ -505,6 +511,18 @@ class HistogramOverlay(QWidget):
         log_c = np.log1p(counts.astype(np.float64))
         peak  = log_c.max()
         self._log_counts = log_c / peak if peak > 0 else log_c
+        
+        # Absolute full-range histogram
+        abs_lo = float(np.min(flat))
+        abs_hi = float(np.max(flat))
+        if abs_hi == abs_lo:
+            abs_hi = abs_lo + 1.0
+        self._abs_lo, self._abs_hi = abs_lo, abs_hi
+        
+        counts_full, _ = np.histogram(flat, bins=256, range=(abs_lo, abs_hi))
+        log_c_full = np.log1p(counts_full.astype(np.float64))
+        peak_full = log_c_full.max()
+        self._full_log_counts = log_c_full / peak_full if peak_full > 0 else log_c_full
 
         self._vmin, self._vmax, self._gamma = vmin, vmax, gamma
         self.update()
@@ -518,6 +536,10 @@ class HistogramOverlay(QWidget):
 
     def _data_to_x(self, v: float) -> float:
         t = (v - self._data_lo) / (self._data_hi - self._data_lo)
+        return self.MX + t * self._content_w()
+
+    def _abs_to_x(self, v: float) -> float:
+        t = (v - self._abs_lo) / (self._abs_hi - self._abs_lo)
         return self.MX + t * self._content_w()
 
     def _gamma_x(self) -> float:
@@ -538,7 +560,7 @@ class HistogramOverlay(QWidget):
         p.setBrush(QBrush(QColor(18, 18, 18, 210)))
         p.drawRoundedRect(0, 0, self.W, self.H, 6, 6)
 
-        # Histogram bars
+        # Primary Histogram bars
         if self._log_counts is not None:
             n   = len(self._log_counts)
             bw  = self._content_w() / n
@@ -551,8 +573,28 @@ class HistogramOverlay(QWidget):
                 bx = int(self.MX + i * bw)
                 p.setBrush(QBrush(QColor(170, 170, 170, 210)))
                 p.drawRect(bx, self.HIST_BOT - bh, max(1, int(bw)), bh)
+                
+        # Full-Range Sub-Histogram
+        if self._full_log_counts is not None:
+            n = len(self._full_log_counts)
+            bw = self._content_w() / n
+            bar_max_h = self.FULL_BOT - self.FULL_TOP
+            p.setPen(Qt.PenStyle.NoPen)
+            for i, v in enumerate(self._full_log_counts):
+                bh = int(v * bar_max_h)
+                if bh < 1:
+                    continue
+                bx = int(self.MX + i * bw)
+                # Paint absolute minimum/maximum bins red if clipped, else dark grey
+                if i == 0 and v > 0.1:
+                    p.setBrush(QBrush(QColor(255, 80, 80, 210)))
+                elif i == n - 1 and v > 0.1:
+                    p.setBrush(QBrush(QColor(255, 80, 80, 210)))
+                else:
+                    p.setBrush(QBrush(QColor(100, 100, 100, 180)))
+                p.drawRect(bx, self.FULL_BOT - bh, max(1, int(bw)), bh)
 
-        # Markers
+        # Primary Markers
         marker_xs = {
             "black": self._data_to_x(self._vmin),
             "mid":   self._gamma_x(),
@@ -562,11 +604,19 @@ class HistogramOverlay(QWidget):
             col = self._COLORS[name]
             ix  = int(round(mx))
 
-            # Dashed vertical line through histogram
+            # Dashed vertical line through primary histogram
             pen = QPen(QColor(col.red(), col.green(), col.blue(), 140), 1,
                        Qt.PenStyle.DashLine)
             p.setPen(pen)
             p.drawLine(ix, self.HIST_TOP, ix, self.HIST_BOT)
+            
+        # Sub-layer bounds indicators (Draw black/white stretch bounds on the full range graph)
+        b_x = int(round(self._abs_to_x(self._vmin)))
+        w_x = int(round(self._abs_to_x(self._vmax)))
+        p.setPen(QPen(self._COLORS["black"], 1))
+        p.drawLine(b_x, self.FULL_TOP, b_x, self.FULL_BOT)
+        p.setPen(QPen(self._COLORS["white"], 1))
+        p.drawLine(w_x, self.FULL_TOP, w_x, self.FULL_BOT)
 
         # Labels for min/max boundaries
         font = p.font()
@@ -575,11 +625,11 @@ class HistogramOverlay(QWidget):
         p.setPen(QColor(170, 170, 170, 255))
         
         lo_str = f"{self._data_lo:.1f}" if self._data_lo < 100 else f"{int(self._data_lo)}"
-        p.drawText(self.MX, self.HIST_BOT + 8, lo_str)
+        p.drawText(self.MX, self.HIST_BOT + 9, lo_str)
         
         hi_str = f"{self._data_hi:.1f}" if self._data_hi < 100 else f"{int(self._data_hi)}"
         hi_w = p.fontMetrics().horizontalAdvance(hi_str)
-        p.drawText(self.W - self.MX - hi_w, self.HIST_BOT + 8, hi_str)
+        p.drawText(self.W - self.MX - hi_w, self.HIST_BOT + 9, hi_str)
 
 # ---------------------------------------------------------------------------
 # Stretch data container
@@ -1400,13 +1450,22 @@ class FitsView(QGraphicsView):
         if 0 <= x < w and 0 <= y < h:
             self.setCursor(Qt.CursorShape.CrossCursor)
             
-            # Fetch raw pixel data
+            # Reconstruct the absolute raw FITS values by reversing the 16-bit quantization curve
+            _lo, _hi = self._stretch_lo, self._stretch_hi
+            
             if self._stretch_u16.ndim == 2:
-                val = self._stretch_u16[y, x]
-                text = f"Val: {val}"
+                uval = self._stretch_u16[y, x]
+                raw_val = (uval / 65535.0) * (_hi - _lo) + _lo
+                text = f"Val: {raw_val:.1f}" if _hi < 100 else f"Val: {int(raw_val)}"
             else:
-                r, g, b = self._stretch_u16[y, x]
-                text = f"R:{r} G:{g} B:{b}"
+                ur, ug, ub = self._stretch_u16[y, x]
+                rr = (ur / 65535.0) * (_hi - _lo) + _lo
+                rg = (ug / 65535.0) * (_hi - _lo) + _lo
+                rb = (ub / 65535.0) * (_hi - _lo) + _lo
+                if _hi < 100:
+                    text = f"R:{rr:.1f} G:{rg:.1f} B:{rb:.1f}"
+                else:
+                    text = f"R:{int(rr)} G:{int(rg)} B:{int(rb)}"
                 
             # Crop tiny 15x15 region (viewport handles bounding limits safely)
             crop_size = 15
