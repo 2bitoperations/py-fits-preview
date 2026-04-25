@@ -20,7 +20,7 @@ _numba_lock = threading.Lock()
 if HAS_NUMBA:
     _log.info("Using Numba backend for MTF stretch.")
     
-    @nb.njit(parallel=True, fastmath=True)
+    @nb.njit(parallel=True, fastmath=True, cache=True)
     def _apply_mtf_color_numba(u16: np.ndarray, black: np.ndarray, span: np.ndarray, M_luma: float) -> np.ndarray:
         """
         Numba-accelerated color MTF stretch.

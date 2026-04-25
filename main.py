@@ -4,6 +4,7 @@ import sys
 import time
 import traceback
 import argparse
+import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 import cv2
@@ -1086,23 +1087,35 @@ class FitsView(QGraphicsView):
             _log.debug("viewport_state: fit_pending is True, returning None")
             return None
         if self._saved_viewport is not None:
-            t, c = self._saved_viewport
             _log.debug("viewport_state: returning cached _saved_viewport")
-            return (t, c, self._pixmap_size)
-        center = self.mapToScene(self.viewport().rect().center())
-        _log.debug("viewport_state: captured live transform %s and center %s", self.transform(), center)
-        return (self.transform(), center, self._pixmap_size)
+            return self._saved_viewport
+        return (
+            self.transform(),
+            self.horizontalScrollBar().value(),
+            self.verticalScrollBar().value(),
+            self._pixmap_size
+        )
 
     def _apply_pending_restore(self):
         if self._saved_viewport is not None:
-            t, c = self._saved_viewport
-            _log.debug("_apply_pending_restore: applying transform %s and center %s", t, c)
-            self._saved_viewport = None
-            self.setTransform(t)
-            
-            # centerOn needs the view to have established its viewport geometry,
-            # which happens reliably in resizeEvent.
-            self.centerOn(c)
+            # Check length for backwards compatibility with any remaining 3-element tuples in cache
+            if len(self._saved_viewport) == 4:
+                t, h_val, v_val, psize = self._saved_viewport
+                self._saved_viewport = None
+                self.setTransform(t)
+                
+                # Defer setting scroll values until the layout completes
+                def restore_scroll():
+                    self.horizontalScrollBar().setValue(h_val)
+                    self.verticalScrollBar().setValue(v_val)
+                QTimer.singleShot(0, restore_scroll)
+                
+            elif len(self._saved_viewport) == 3:
+                t, c, psize = self._saved_viewport
+                self._saved_viewport = None
+                self.setTransform(t)
+                QTimer.singleShot(0, lambda: self.centerOn(c))
+                
             self._is_fitted = False
 
     def _fit(self):
@@ -1278,8 +1291,23 @@ class FitsView(QGraphicsView):
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
-        self._is_fitted = False
         factor = 1.15 ** (event.angleDelta().y() / 120.0)
+        
+        scene_rect = self.scene().itemsBoundingRect()
+        if scene_rect.width() > 0 and scene_rect.height() > 0:
+            vp_rect = self.viewport().rect()
+            min_scale = min(vp_rect.width() / scene_rect.width(),
+                            vp_rect.height() / scene_rect.height())
+            
+            current_scale = self.transform().m11()
+            new_scale = current_scale * factor
+            
+            if factor < 1.0 and new_scale <= min_scale:
+                # Clamp to exact fit
+                self._fit()
+                return
+                
+        self._is_fitted = False
         self.scale(factor, factor)
 
 
@@ -1317,6 +1345,16 @@ class MainWindow(QMainWindow):
             max_workers=1, thread_name_prefix="fits-io")
         self._compute_executor = ThreadPoolExecutor(
             max_workers=_COMPUTE_WORKERS, thread_name_prefix="fits-compute")
+
+        # Dispatch a tiny warmup matrix to force Numba JIT compilation/deserialization 
+        # in the background before the first real megapixel image arrives.
+        self._compute_executor.submit(
+            compute_backend.apply_mtf_color,
+            np.zeros((1, 1, 3), dtype=np.uint16),
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            0.5
+        )
 
         # Stretch data cache (u16 + MTF QImage) for both current and preloaded files.
         self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
@@ -1490,9 +1528,9 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap.fromImage(stretch.mtf_qimage)
                 vp_to_restore = None
                 if saved_viewport is not None:
-                    _, _, old_size = saved_viewport
+                    old_size = saved_viewport[-1]
                     if old_size == (pixmap.width(), pixmap.height()):
-                        vp_to_restore = (saved_viewport[0], saved_viewport[1])
+                        vp_to_restore = saved_viewport
                         _log.debug("_load_fits (HIT): matched old size %s, propagating vp_to_restore", old_size)
                     else:
                         _log.debug("_load_fits (HIT): size mismatch, discarding saved_viewport")
@@ -1558,9 +1596,9 @@ class MainWindow(QMainWindow):
         self._pending_saved_viewport = None
         vp_to_restore = None
         if saved_vp is not None:
-            _, _, old_size = saved_vp
+            old_size = saved_vp[-1]
             if old_size == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
-                vp_to_restore = (saved_vp[0], saved_vp[1])
+                vp_to_restore = saved_vp
                 _log.debug("_deliver_stretch: matched old size %s, propagating vp_to_restore", old_size)
             else:
                 _log.debug("_deliver_stretch: size mismatch, discarding saved_viewport")
