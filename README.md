@@ -49,7 +49,7 @@ uv run python3 main.py --ahead 10 --behind 2 --cache 15 /path/to/image.fits
 You can install FITS Preview as the default double-click handler for `.fit` and `.fits` files natively in your operating system.
 
 **macOS (Finder)**:
-Run `./install_mac.sh`. This generates an AppleScript Application Wrapper inside `~/Applications/FITS Preview.app`. You can then Right Click any `.fits` file in Finder → Get Info → Open With: "FITS Preview" → Change All.
+Run `./install_mac.sh`. This generates an AppleScript Application Wrapper inside `~/Applications/py-fits-preview.app`. You can then Right Click any `.fits` file in Finder → Get Info → Open With: "py-fits-preview" → Change All.
 
 **Linux (GNOME / KDE)**:
 Run `./install_linux.sh`. This generates a `py-fits-preview.desktop` shortcut inside `~/.local/share/applications` and updates your XDG mime database so your file manager natively knows to route FITS documents to the pipeline.
