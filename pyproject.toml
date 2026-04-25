@@ -5,6 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = [
     "astropy>=7.2.0",
+    "numba>=0.65.1",
     "opencv-python-headless>=4.8.0",
     "pyside6>=6.11.0",
     "scipy>=1.17.1",
@@ -16,4 +17,5 @@ fits-preview = "main:main"
 [dependency-groups]
 dev = [
     "pyinstaller>=6.20.0",
+    "pytest>=9.0.3",
 ]

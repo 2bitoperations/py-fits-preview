@@ -3,6 +3,8 @@ import os
 import sys
 import time
 import traceback
+import argparse
+import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 import cv2
@@ -15,6 +17,7 @@ from scipy.stats import median_abs_deviation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QSizePolicy, QWidget,
+    QVBoxLayout, QProgressBar,
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
@@ -354,78 +357,56 @@ def _compute_mtf_lut(u16_flat: np.ndarray) -> np.ndarray:
     return (_mtf_rational(t, M) * 255.0).astype(np.uint8)
 
 
+import compute_backend
+
 def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
     """Per-channel unlinked MTF with luminance-based colour preservation.
-
-    Pipeline
-    --------
-    1. Per-channel statistics (non-zero pixels only — avoids black-border bias).
-       shadow_clip = -2.8 (PixInsight standard; pushes black point 2.8 σ below
-       sky median, preserving faint dust/nebulosity rather than clipping it).
-    2. Per-channel black-point subtraction + normalization to [0, 1] using each
-       channel's own span.  This forces all three backgrounds toward zero,
-       neutralizing skyglow colour casts without a separate WB step.
-    3. Compute per-channel midtone balance M_c such that each channel's
-       normalized sky median maps to target_bkg = 0.25.
-    4. Extract linear luminance Y (Rec.709) from the BG-subtracted, normalised
-       channels BEFORE any MTF is applied.
-    5. Derive a luminance MTF from Y's own sky-median statistics.
-    6. Reconstruct colour: scale every channel by Y_stretched / Y_linear.
-       This preserves star hue in the highlights — a star with R:G:B = 8:4:1
-       stays orange after stretch instead of bloating toward white.
-
-    u16 : (H, W, 3) uint16 — globally quantised linear data
-    Returns (H, W, 3) uint8.
+    
+    Uses compute_backend (Numba/GPU) for the heavy math, avoiding intermediate memory allocations.
     """
-    lin = u16.astype(np.float32) / 65535.0   # (H, W, 3), linear [0, 1]
+    # ── Subsample for statistics gathering (avoids full array allocation) ──
+    H, W, C = u16.shape
+    N = H * W
+    rng = np.random.default_rng(0)
+    
+    if N > _SUBSAMPLE_N:
+        idx = rng.choice(N, size=_SUBSAMPLE_N, replace=False)
+        u16_flat = u16.reshape(-1, 3)
+        sub_u16 = u16_flat[idx]
+    else:
+        sub_u16 = u16.reshape(-1, 3)
+        
+    sub_lin = sub_u16.astype(np.float32) / 65535.0
 
-    # ── Per-channel black points and spans (exclude zero / border pixels) ──
-    # _mtf_stats returns the same span used to compute M, so normalization
-    # below and the M value are guaranteed consistent.
-    black = np.zeros(3)
-    span  = np.ones(3)
+    # ── Per-channel black points and spans ──
+    black = np.zeros(3, dtype=np.float32)
+    span  = np.ones(3, dtype=np.float32)
     for c in range(3):
-        ch = lin[:, :, c].ravel()
-        b, s, M_c = _mtf_stats(ch)
+        # We can pass the subsampled channel directly to _mtf_stats
+        b, s, M_c = _mtf_stats(sub_lin[:, c])
         black[c] = b
         span[c]  = s
         _log.debug("_apply_mtf_color: ch=%d  black=%.5f  span=%.5f  M=%.5f",
                    c, b, s, M_c)
 
-    # ── Per-channel BG subtraction + normalisation to [0, 1] ──
-    bg_sub = np.clip(
-        (lin - black[np.newaxis, np.newaxis, :]) / span[np.newaxis, np.newaxis, :],
-        0.0, 1.0,
+    # ── Derive Luminance MTF parameter (M_luma) from subsample ──
+    sub_bg_sub = np.clip(
+        (sub_lin - black[np.newaxis, :]) / span[np.newaxis, :], 
+        0.0, 1.0
     )
+    luma_lin = (0.2126 * sub_bg_sub[:, 0] +
+                0.7152 * sub_bg_sub[:, 1] +
+                0.0722 * sub_bg_sub[:, 2])
 
-    # ── Linear luminance (Rec.709) from the per-channel-normalised data ──
-    # bg_sub is already in [0, 1] with background near 0.  We do NOT call
-    # _mtf_stats on luma_lin because that would perform a second shadow clip
-    # on already-BG-subtracted values, producing wild m_norm estimates.
-    # Instead, derive M_luma directly: the luma background median is now
-    # close to 0 in a [0, 1] range, so span_luma ≈ 1 and
-    #   m_norm_luma ≈ median(luma_lin, nonzero pixels)
-    # Then M = 3·m_norm / (2·m_norm + 1) as normal.
-    luma_lin = (0.2126 * bg_sub[:, :, 0] +
-                0.7152 * bg_sub[:, :, 1] +
-                0.0722 * bg_sub[:, :, 2])
-
-    luma_flat = luma_lin.ravel()
-    luma_pos  = luma_flat[luma_flat > 1e-6]
-    luma_med  = float(np.median(luma_pos)) if luma_pos.size >= 100 else float(np.median(luma_flat))
+    luma_pos = luma_lin[luma_lin > 1e-6]
+    luma_med = float(np.median(luma_pos)) if luma_pos.size >= 100 else float(np.median(luma_lin))
     m_norm_luma = float(np.clip(luma_med, 1e-9, 1.0 - 1e-9))
-    M_luma      = 3.0 * m_norm_luma / (2.0 * m_norm_luma + 1.0)
+    M_luma = 3.0 * m_norm_luma / (2.0 * m_norm_luma + 1.0)
     _log.debug("_apply_mtf_color: luma_med=%.5f  m_norm=%.5f  M=%.5f",
                luma_med, m_norm_luma, M_luma)
-    luma_str = _mtf_rational(luma_lin, M_luma)
 
-    # ── Luminance-preserving colour reconstruction ──
-    # safe_luma replaces zero/tiny denominators with 1.0 so np.where's eager
-    # evaluation of luma_str / safe_luma never triggers a divide warning.
-    safe_luma = np.where(luma_lin > 1e-6, luma_lin, 1.0)
-    ratio     = np.where(luma_lin > 1e-6, luma_str / safe_luma, 0.0)
-    result    = np.clip(bg_sub * ratio[:, :, np.newaxis], 0.0, 1.0)
-    return (result * 255.0).astype(np.uint8)
+    # ── Dispatch to backend for full-image execution ──
+    return compute_backend.apply_mtf_color(u16, black, span, M_luma)
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +440,19 @@ def _subsample(arr: np.ndarray, n: int = _SUBSAMPLE_N) -> np.ndarray:
 _FITS_EXTENSIONS = frozenset({".fits", ".fit", ".fts"})
 
 
+import re
+
+def _natural_sort_key(s):
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
 def _fits_siblings(path: str) -> list[str]:
     directory = os.path.dirname(os.path.abspath(path))
-    return sorted(
+    files = [
         os.path.join(directory, name)
         for name in os.listdir(directory)
         if os.path.splitext(name)[1].lower() in _FITS_EXTENSIONS
-    )
+    ]
+    return sorted(files, key=_natural_sort_key)
 
 
 # ---------------------------------------------------------------------------
@@ -670,19 +657,21 @@ class _StretchData:
     interactive stretch.  Kept separate from QImage so the two can be cached
     and delivered independently (QImage for immediate display, u16 for controls).
     """
-    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage")
+    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb")
 
     def __init__(self, u16: np.ndarray, lo: float, hi: float,
-                 raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None):
+                 raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None,
+                 mtf_rgb: np.ndarray | None = None):
         self.u16        = u16         # (H, W) or (H, W, 3) uint16, flipped
         self.lo         = lo          # data value → u16 == 0
         self.hi         = hi          # data value → u16 == 65535
         self.raw_flat   = raw_flat    # float32 flat of pre-debayer data for histogram
         self.mtf_qimage = mtf_qimage  # pre-rendered MTF QImage for instant cache-hit display
+        self.mtf_rgb    = mtf_rgb     # raw uint8 array for headless mode
 
 
 def _compute_from_raw(path: str, raw_data: np.ndarray,
-                      raw_header) -> "_StretchData | None":
+                      raw_header, headless: bool = False) -> "_StretchData | None":
     """Compute stage: debayer + quantize + MTF render.  Runs in compute pool.
 
     Receives raw FITS data already loaded from disk by the I/O worker.
@@ -695,15 +684,34 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
     t_mtf = time.perf_counter()
     if u16.ndim == 2:
         lut    = _compute_mtf_lut(u16.ravel())
-        mtf_qi = _gray_to_qimage(lut[u16])
+        mtf_rgb = lut[u16]
     else:
-        mtf_qi = _rgb_to_qimage(_apply_mtf_color(u16))
+        mtf_rgb = _apply_mtf_color(u16)
+        
+    mtf_qi = None
+    if not headless:
+        mtf_qi = _gray_to_qimage(mtf_rgb) if mtf_rgb.ndim == 2 else _rgb_to_qimage(mtf_rgb)
     _log.debug("[compute] debayer+quantize %.1f ms  MTF %.1f ms  total %.1f ms  %s",
                (t_mtf - t0) * 1000,
                (time.perf_counter() - t_mtf) * 1000,
                (time.perf_counter() - t0) * 1000, name)
-    return _StretchData(u16, lo, hi, raw_flat, mtf_qi)
+    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb)
 
+class LoadingWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        label = QLabel("u know i'm loading dem imgs bro 🙃")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        prog = QProgressBar()
+        prog.setRange(0, 0)
+        prog.setFixedWidth(200)
+        
+        layout.addWidget(label)
+        layout.addWidget(prog)
 
 # ---------------------------------------------------------------------------
 # Qt widgets
@@ -712,7 +720,7 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
 class FitsView(QGraphicsView):
     def __init__(self, qimage: QImage,
                  stretch: _StretchData | None = None,
-                 saved_viewport=None, parent=None):
+                 saved_viewport=None, is_bad: bool = False, parent=None):
         pixmap = QPixmap.fromImage(qimage)
         super().__init__(parent)
 
@@ -745,6 +753,12 @@ class FitsView(QGraphicsView):
         # Histogram overlay — child of the viewport so it stays fixed on screen
         self._histogram = HistogramOverlay(self.viewport())
         self._histogram.stretch_changed.connect(self._on_stretch_changed)
+        
+        self._bad_label = QLabel("🤮", self.viewport())
+        self._bad_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self._bad_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._bad_label.setStyleSheet("color: white; background: transparent;")
+        self._bad_label.setVisible(is_bad)
 
         if stretch is not None:
             self._install_stretch(stretch)
@@ -821,22 +835,33 @@ class FitsView(QGraphicsView):
             self._initial_fit_done = True
             self._fit_pending = True
             QTimer.singleShot(0, self._fit)
-        self._position_histogram()
+        self._position_overlays()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._position_histogram()
+        self._position_overlays()
 
     # ------------------------------------------------------------------
-    # Histogram position
+    # Overlays position
     # ------------------------------------------------------------------
 
-    def _position_histogram(self):
-        h = self._histogram
+    def _position_overlays(self):
         vp = self.viewport()
         margin = 12
+        
+        h = self._histogram
         h.move(margin, vp.height() - h.height() - margin)
         h.raise_()
+        
+        font = self._bad_label.font()
+        font.setPixelSize(max(24, int(vp.width() * 0.10)))
+        self._bad_label.setFont(font)
+        self._bad_label.adjustSize()
+        self._bad_label.move(vp.width() - self._bad_label.width() - margin, margin)
+        self._bad_label.raise_()
+        
+    def set_bad(self, is_bad: bool):
+        self._bad_label.setVisible(is_bad)
 
     # ------------------------------------------------------------------
     # Stretch control
@@ -959,6 +984,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FITS Preview")
         self.setGeometry(QApplication.primaryScreen().availableGeometry())
         self._fits_files: list[str] = []
+        self._bad_files: set[str] = set()
         self._current_index: int    = 0
         self._nav_direction: int    = 1
         self._stretch_generation: int = 0   # incremented on each navigate; stale
@@ -988,6 +1014,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+2"),          self, self._asinh_stretch)
         QShortcut(QKeySequence("Ctrl+3"),          self, self._zscale_stretch)
         QShortcut(QKeySequence("Ctrl+4"),          self, self._auto_stretch)
+        QShortcut(QKeySequence(Qt.Key.Key_Space),  self, self._toggle_bad)
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self, self._commit_bad_files)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter),  self, self._commit_bad_files)
 
         if fits_path:
             self._load_fits(fits_path)
@@ -1125,7 +1154,7 @@ class MainWindow(QMainWindow):
         try:
             # ── Step 1: Check stretch cache (includes harvesting preloads) ─
             stretch = self._stretch_cache_get(abs_path)
-            _log.debug("_load_fits: stretch %s  [%s]  %s",
+            _log.info("_load_fits: stretch %s  [%s]  %s",
                        "HIT" if stretch else "MISS (async)", self._queue_info(), name)
 
             if stretch is not None:
@@ -1136,8 +1165,9 @@ class MainWindow(QMainWindow):
                     _, _, old_size = saved_viewport
                     if old_size == (pixmap.width(), pixmap.height()):
                         vp_to_restore = (saved_viewport[0], saved_viewport[1])
+                is_bad = abs_path in self._bad_files
                 view = FitsView(stretch.mtf_qimage, stretch,
-                                saved_viewport=vp_to_restore)
+                                saved_viewport=vp_to_restore, is_bad=is_bad)
                 self.setCentralWidget(view)
                 _log.debug("_load_fits: displayed in %.1f ms  [%s]  %s",
                            (time.perf_counter() - t0) * 1000, self._queue_info(), name)
@@ -1146,7 +1176,7 @@ class MainWindow(QMainWindow):
                 # Store the saved viewport so _deliver_stretch can restore it.
                 self._pending_saved_viewport = saved_viewport
                 if not isinstance(self.centralWidget(), FitsView):
-                    self.setCentralWidget(QLabel("Loading…"))
+                    self.setCentralWidget(LoadingWidget())
 
                 def _on_pipeline_done(future):
                     self._stretch_pending -= 1
@@ -1197,13 +1227,14 @@ class MainWindow(QMainWindow):
 
         _log.debug("_deliver_stretch: installing [%s]  %s",
                    self._queue_info(), os.path.basename(path))
-        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore)
+        is_bad = path in self._bad_files
+        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
         self.setCentralWidget(view)
 
     def _navigate(self, delta: int):
         if not self._fits_files:
             return
-        _log.debug("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
+        _log.info("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
         t0 = time.perf_counter()
         self._nav_direction = 1 if delta > 0 else -1
         saved_vp = None
@@ -1216,28 +1247,79 @@ class MainWindow(QMainWindow):
                    self._queue_info())
 
     def _auto_stretch(self):
-        _log.debug("key: Cmd+4 auto-stretch  [%s]", self._queue_info())
+        _log.info("key: Cmd+4 auto-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.auto_stretch()
 
     def _asinh_stretch(self):
-        _log.debug("key: Cmd+2 asinh-stretch  [%s]", self._queue_info())
+        _log.info("key: Cmd+2 asinh-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_asinh_stretch()
 
     def _zscale_stretch(self):
-        _log.debug("key: Cmd+3 zscale-stretch  [%s]", self._queue_info())
+        _log.info("key: Cmd+3 zscale-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_zscale_stretch()
 
     def _mtf_stretch(self):
-        _log.debug("key: Cmd+1 mtf-stretch  [%s]", self._queue_info())
+        _log.info("key: Cmd+1 mtf-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_mtf_stretch()
+
+    def _toggle_bad(self):
+        if not self._fits_files: return
+        path = self._fits_files[self._current_index]
+        view = self.centralWidget()
+        if path in self._bad_files:
+            self._bad_files.remove(path)
+            if isinstance(view, FitsView): view.set_bad(False)
+            _log.info("key: Space (unmarked bad)  %s", os.path.basename(path))
+        else:
+            self._bad_files.add(path)
+            if isinstance(view, FitsView): view.set_bad(True)
+            _log.info("key: Space (marked bad)  %s", os.path.basename(path))
+
+    def _commit_bad_files(self):
+        if not self._bad_files: return
+        
+        current_path = self._fits_files[self._current_index]
+        parent_dir = os.path.dirname(current_path)
+        bad_dir = os.path.join(parent_dir, "bad")
+        os.makedirs(bad_dir, exist_ok=True)
+        
+        count = len(self._bad_files)
+        _log.info("key: Enter (moving %d bad files to %s)", count, bad_dir)
+        
+        for bad_file in list(self._bad_files):
+            try:
+                shutil.move(bad_file, os.path.join(bad_dir, os.path.basename(bad_file)))
+            except Exception as e:
+                _log.error("Failed to move %s: %s", bad_file, e)
+                
+        self._bad_files.clear()
+        
+        # Re-index
+        self._fits_files = _fits_siblings(current_path)
+        if not self._fits_files:
+            self._current_index = 0
+            self.setWindowTitle("FITS Preview — Empty")
+            
+            label = QLabel("u got no imgs bro 🤷‍♂️")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            font = label.font()
+            font.setPixelSize(36)
+            label.setFont(font)
+            self.setCentralWidget(label)
+            return
+            
+        if self._current_index >= len(self._fits_files):
+            self._current_index = len(self._fits_files) - 1
+            
+        self._load_fits(self._fits_files[self._current_index])
 
     def _shutdown(self):
         """Cancel pending work and stop executor threads immediately on quit."""
@@ -1284,17 +1366,90 @@ def _install_stderr_excepthook():
     sys.excepthook = hook
 
 
+def run_headless(fits_path: str, out_path: str, stretch_type: str):
+    """Executes the pipeline without spawning a PySide6 GUI and saves the output."""
+    _log.info(f"Running in headless mode. Input: {fits_path}")
+    raw_data, raw_header = _load_path_raw_data(fits_path)
+    if raw_data is None:
+        _log.error("Failed to load FITS data.")
+        sys.exit(1)
+        
+    sd = _compute_from_raw(fits_path, raw_data, raw_header, headless=True)
+    if sd is None:
+        _log.error("Compute pipeline failed.")
+        sys.exit(1)
+        
+    rgb = sd.mtf_rgb
+    
+    if stretch_type != "mtf":
+        if stretch_type == "auto":
+            sub = _subsample(sd.raw_flat)
+            vmin = float(np.nanpercentile(sub, 1))
+            vmax = float(np.nanpercentile(sub, 99))
+            scale = sd.hi - sd.lo
+            if scale == 0: scale = 1.0
+            vmin_u = (vmin - sd.lo) / scale * 65535
+            vmax_u = (vmax - sd.lo) / scale * 65535
+            span = vmax_u - vmin_u
+            idx = np.arange(65536, dtype=np.float64)
+            t = np.clip((idx - vmin_u) / span if span > 0 else idx * 0.0, 0.0, 1.0)
+            lut = (t * 255.0).astype(np.uint8)
+            rgb = lut[sd.u16]
+        elif stretch_type == "zscale":
+            lut, _, _ = _compute_zscale_lut(sd.lo, sd.hi, sd.raw_flat)
+            rgb = lut[sd.u16]
+        elif stretch_type == "asinh":
+            sub = _subsample(sd.raw_flat)
+            vmin = float(np.nanpercentile(sub, 1))
+            vmax = float(np.nanpercentile(sub, 99))
+            lut = _compute_asinh_lut(sd.lo, sd.hi, vmin, vmax, 5.0)
+            rgb = lut[sd.u16]
+            
+    if rgb.ndim == 3:
+        bgr = rgb[:, :, ::-1]  # OpenCV expects BGR
+    else:
+        bgr = rgb
+        
+    import cv2
+    cv2.imwrite(out_path, bgr)
+    _log.info(f"Saved {stretch_type} stretch result to {out_path}")
+
+
 def main():
     _install_stderr_excepthook()
+    
+    parser = argparse.ArgumentParser(description="FITS Image Preview and Stretch Tool")
+    parser.add_argument("file", nargs="?", help="Path to the FITS file to load")
+    parser.add_argument("--headless", action="store_true", help="Run without UI, saving the result to disk")
+    parser.add_argument("--out", type=str, help="Output path for the stretched image (required if --headless)")
+    parser.add_argument("--stretch", choices=["mtf", "auto", "zscale", "asinh"], default="mtf", 
+                        help="Stretch algorithm to use (default: mtf)")
+    parser.add_argument("--log", action="store_true", help="Log debug output to /tmp/py-fits-preview.log")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging to console")
+    args = parser.parse_args()
+
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
-    app = FitsApp(sys.argv)
-    fits_path = sys.argv[1] if len(sys.argv) > 1 else None
-    window = MainWindow(fits_path)
+    
+    if args.log:
+        file_handler = logging.FileHandler("/tmp/py-fits-preview.log")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-5s %(message)s", datefmt="%H:%M:%S"))
+        logging.getLogger().addHandler(file_handler)
+    
+    if args.headless:
+        if not args.file:
+            parser.error("A FITS file is required in headless mode.")
+        if not args.out:
+            parser.error("--out argument is required in headless mode.")
+        run_headless(args.file, args.out, args.stretch)
+        return
+
+    app = FitsApp([sys.argv[0]])
+    window = MainWindow(args.file)
     app.aboutToQuit.connect(window._shutdown)
     app.set_main_window(window)
     window.show()
