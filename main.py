@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QSizePolicy, QWidget,
     QVBoxLayout, QProgressBar, QGraphicsOpacityEffect,
+    QSplitter, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView, QMenu
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
@@ -413,10 +414,7 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
 # Preload / cache / sampling constants
 # ---------------------------------------------------------------------------
 
-_PRELOAD_HIT       = (3, 2)
-_PRELOAD_MISS      = (4, 2)
 _COMPUTE_WORKERS   = 4          # CPU workers for debayer + quantize + MTF
-_STRETCH_CACHE_MAX = 6          # u16 arrays ~121 MB each → ~726 MB max
 _SUBSAMPLE_N       = 500_000    # pixels used for median/MAD/histogram stats
 
 
@@ -657,17 +655,18 @@ class _StretchData:
     interactive stretch.  Kept separate from QImage so the two can be cached
     and delivered independently (QImage for immediate display, u16 for controls).
     """
-    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb")
+    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb", "raw_header")
 
     def __init__(self, u16: np.ndarray, lo: float, hi: float,
                  raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None,
-                 mtf_rgb: np.ndarray | None = None):
+                 mtf_rgb: np.ndarray | None = None, raw_header: dict | None = None):
         self.u16        = u16         # (H, W) or (H, W, 3) uint16, flipped
         self.lo         = lo          # data value → u16 == 0
         self.hi         = hi          # data value → u16 == 65535
         self.raw_flat   = raw_flat    # float32 flat of pre-debayer data for histogram
         self.mtf_qimage = mtf_qimage  # pre-rendered MTF QImage for instant cache-hit display
         self.mtf_rgb    = mtf_rgb     # raw uint8 array for headless mode
+        self.raw_header = raw_header
 
 
 def _compute_from_raw(path: str, raw_data: np.ndarray,
@@ -695,7 +694,231 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
                (t_mtf - t0) * 1000,
                (time.perf_counter() - t_mtf) * 1000,
                (time.perf_counter() - t0) * 1000, name)
-    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb)
+    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb, dict(raw_header))
+
+import json
+from pathlib import Path
+
+import os
+
+class ConfigManager:
+    def __init__(self):
+        self.config_path = Path.home() / ".config" / "py-fits-preview.conf"
+        
+        try:
+            ram_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        except (AttributeError, ValueError):
+            ram_bytes = 16 * 1024**3
+        
+        allowed = int((ram_bytes * 0.10) / (121 * 1024**2))
+        allowed = max(5, allowed)
+        
+        self.config = {
+            "header_state": 0, # 0=Hidden, 1=Transparent, 2=Opaque
+            "header_width_pct": 0.15,
+            "show_all_headers": False,
+            "checked_headers": [],
+            "preload_ahead": int(allowed * 0.6),
+            "preload_behind": int(allowed * 0.15),
+            "cache_max": allowed - int(allowed * 0.6) - int(allowed * 0.15)
+        }
+        self.load()
+
+    def load(self):
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, "r") as f:
+                    data = json.load(f)
+                    self.config.update(data)
+            except Exception as e:
+                _log.error("Failed to load config: %s", e)
+
+    def save(self):
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.config_path, "w") as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            _log.error("Failed to save config: %s", e)
+
+_config = ConfigManager()
+
+class HeaderPanelWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setShowGrid(False)
+        
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: rgba(34, 34, 34, 0.85);")
+        self.table.setStyleSheet("background-color: transparent; color: white;")
+        
+        layout.addWidget(self.table)
+        
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.cellChanged.connect(self._on_cell_changed)
+        self._raw_header = None
+        
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        show_all_action = menu.addAction("Show All")
+        show_all_action.setCheckable(True)
+        show_all_action.setChecked(_config.config["show_all_headers"])
+        
+        action = menu.exec(self.mapToGlobal(pos))
+        if action == show_all_action:
+            _config.config["show_all_headers"] = action.isChecked()
+            _config.save()
+            self.update_header(self._raw_header)
+            
+    def _on_cell_changed(self, row, col):
+        if col != 0: return
+        item = self.table.item(row, 0)
+        if not item: return
+        key = item.text()
+        checked_list = _config.config["checked_headers"]
+        
+        changed = False
+        if item.checkState() == Qt.CheckState.Checked:
+            if key not in checked_list:
+                checked_list.append(key)
+                changed = True
+        else:
+            if key in checked_list:
+                checked_list.remove(key)
+                changed = True
+                
+        if changed:
+            _config.config["checked_headers"] = checked_list
+            _config.save()
+            
+    def update_header(self, header):
+        self._raw_header = header
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        
+        if not header:
+            self.table.blockSignals(False)
+            return
+            
+        show_all = _config.config["show_all_headers"]
+        checked_list = _config.config["checked_headers"]
+        
+        for k, v in header.items():
+            if not show_all and k not in checked_list:
+                continue
+                
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            
+            key_item = QTableWidgetItem(str(k))
+            if show_all:
+                key_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                key_item.setCheckState(Qt.CheckState.Checked if k in checked_list else Qt.CheckState.Unchecked)
+            else:
+                key_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                
+            val_item = QTableWidgetItem(str(v))
+            self.table.setItem(row, 0, key_item)
+            self.table.setItem(row, 1, val_item)
+            
+        self.table.blockSignals(False)
+
+class MainContainer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+        
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.layout.addWidget(self.splitter)
+        
+        self.header_panel = HeaderPanelWidget()
+        self.header_panel.hide()
+        
+        self.view_container = QWidget()
+        self.view_layout = QVBoxLayout(self.view_container)
+        self.view_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.splitter.addWidget(self.header_panel)
+        self.splitter.addWidget(self.view_container)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        
+        self._current_view = None
+        self._gauges = BufferGauges(self.view_container)
+        self.apply_header_state()
+        
+    def set_view(self, view: QWidget, header_data=None):
+        if self._current_view:
+            self.view_layout.removeWidget(self._current_view)
+            self._current_view.setParent(None)
+            self._current_view.deleteLater()
+        self._current_view = view
+        self.view_layout.addWidget(self._current_view)
+        self._gauges.raise_()
+        self.header_panel.update_header(header_data)
+        
+    def update_gauges(self, back_pct: float, fwd_pct: float):
+        self._gauges.update_gauges(back_pct, fwd_pct)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        margin = 12
+        self._gauges.move(self.view_container.width() - self._gauges.width() - margin,
+                          self.view_container.height() - self._gauges.height() - margin)
+        self._gauges.raise_()
+
+    def get_view(self) -> QWidget:
+        return self._current_view
+        
+    def toggle_header_state(self):
+        state = _config.config["header_state"]
+        state = (state + 1) % 3
+        _config.config["header_state"] = state
+        _config.save()
+        self.apply_header_state()
+        
+    def apply_header_state(self):
+        state = _config.config["header_state"]
+        vp_width = self.width() if self.width() > 100 else 1000
+        hw = int(vp_width * _config.config["header_width_pct"])
+        
+        if state == 0:
+            self.header_panel.setParent(self.splitter)
+            self.splitter.insertWidget(0, self.header_panel)
+            self.header_panel.hide()
+        elif state == 1:
+            self.header_panel.setParent(self)
+            self.header_panel.setStyleSheet("background-color: rgba(34, 34, 34, 0.85);")
+            self.header_panel.setGeometry(0, 0, hw, self.height())
+            self.header_panel.show()
+            self.header_panel.raise_()
+        elif state == 2:
+            self.header_panel.setParent(self.splitter)
+            self.splitter.insertWidget(0, self.header_panel)
+            self.header_panel.setStyleSheet("background-color: #222222;")
+            self.header_panel.show()
+            self.splitter.setSizes([hw, vp_width - hw])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        state = _config.config["header_state"]
+        if state == 1:
+            hw = int(self.width() * _config.config["header_width_pct"])
+            self.header_panel.setGeometry(0, 0, hw, self.height())
+
+from PySide6.QtCore import Property
 
 class BufferGauges(QWidget):
     def __init__(self, parent=None):
@@ -704,12 +927,21 @@ class BufferGauges(QWidget):
         self.back_pct = 0.0
         self.fwd_pct = 0.0
         
-        self._eff = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self._eff)
-        self._eff.setOpacity(0.9)
-        self._anim = QPropertyAnimation(self._eff, b"opacity")
+        self.setFixedSize(16, 60)
+        
+        self._opacity = 0.9
+        self._anim = QPropertyAnimation(self, b"opacity")
         self._anim.setDuration(500)
         self._is_fading_out = False
+
+    def get_opacity(self):
+        return self._opacity
+
+    def set_opacity(self, value):
+        self._opacity = value
+        self.update()
+
+    opacity = Property(float, get_opacity, set_opacity)
 
     def update_gauges(self, back_pct: float, fwd_pct: float):
         self.back_pct = back_pct
@@ -717,22 +949,25 @@ class BufferGauges(QWidget):
         self.update()
         
         is_full = (self.back_pct >= 0.99) and (self.fwd_pct >= 0.99)
-        if is_full and not self._is_fading_out and self._eff.opacity() > 0.0:
+        if is_full and not self._is_fading_out and self._opacity > 0.0:
             self._anim.stop()
-            self._anim.setStartValue(self._eff.opacity())
+            self._anim.setStartValue(self._opacity)
             self._anim.setEndValue(0.0)
             self._anim.start()
             self._is_fading_out = True
-        elif not is_full and (self._is_fading_out or self._eff.opacity() < 0.9):
+        elif not is_full and (self._is_fading_out or self._opacity < 0.9):
             self._anim.stop()
-            self._anim.setStartValue(self._eff.opacity())
+            self._anim.setStartValue(self._opacity)
             self._anim.setEndValue(0.9)
             self._anim.start()
             self._is_fading_out = False
 
     def paintEvent(self, event):
+        if self._opacity <= 0.0:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self._opacity)
         w, h = self.width(), self.height()
         bar_w = int(w * 0.4)
         
@@ -741,11 +976,12 @@ class BufferGauges(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(x, 0, bar_w, h - 1)
             
-            color = QColor.fromHsv(int(pct * 120), 200, 200)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            fill_h = int((h - 2) * pct)
-            painter.drawRect(x + 1, h - 1 - fill_h, bar_w - 1, fill_h)
+            if pct > 0:
+                color = QColor.fromHsv(int(pct * 120), 200, 200)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                fill_h = int((h - 2) * pct)
+                painter.drawRect(x + 1, h - 1 - fill_h, bar_w - 1, fill_h)
 
         draw_bar(0, self.back_pct)
         draw_bar(w - bar_w, self.fwd_pct)
@@ -784,6 +1020,7 @@ class FitsView(QGraphicsView):
         self.setScene(scene)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setRenderHints(QPainter.RenderHint.Antialiasing |
                             QPainter.RenderHint.SmoothPixmapTransform)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -792,6 +1029,7 @@ class FitsView(QGraphicsView):
         self._saved_viewport = saved_viewport
         self._fit_pending    = False
         self._initial_fit_done = saved_viewport is not None
+        self._is_fitted      = True
 
         self._stretch_u16  = None
         self._stretch_lo   = 0.0
@@ -818,9 +1056,6 @@ class FitsView(QGraphicsView):
         self._eol_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._eol_label.setStyleSheet("color: white; background: transparent;")
         self._eol_label.setVisible(False)
-        
-        self._gauges = BufferGauges(self.viewport())
-        self._gauges.resize(20, 60)
 
         if stretch is not None:
             self._install_stretch(stretch)
@@ -882,6 +1117,7 @@ class FitsView(QGraphicsView):
 
     def _fit(self):
         self._fit_pending = False
+        self._is_fitted = True
         self.fitInView(self.scene().itemsBoundingRect(),
                        Qt.AspectRatioMode.KeepAspectRatio)
 
@@ -901,6 +1137,8 @@ class FitsView(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._initial_fit_done and getattr(self, '_is_fitted', False):
+            self._fit()
         self._position_overlays()
 
     # ------------------------------------------------------------------
@@ -928,10 +1166,6 @@ class FitsView(QGraphicsView):
         self._eol_label.adjustSize()
         self._eol_label.move(margin, margin)
         self._eol_label.raise_()
-        
-        self._gauges.move(vp.width() - self._gauges.width() - margin, vp.height() - self._gauges.height() - margin)
-        self._gauges.raise_()
-        
     def set_bad(self, is_bad: bool):
         self._bad_label.setVisible(is_bad)
 
@@ -948,8 +1182,7 @@ class FitsView(QGraphicsView):
         self._eol_anim.finished.connect(lambda: self._eol_label.setVisible(False))
         self._eol_anim.start(QPropertyAnimation.DeletionPolicy.KeepWhenStopped)
 
-    def update_gauges(self, back_pct: float, fwd_pct: float):
-        self._gauges.update_gauges(back_pct, fwd_pct)
+
 
     # ------------------------------------------------------------------
     # Stretch control
@@ -1055,6 +1288,7 @@ class FitsView(QGraphicsView):
     # ------------------------------------------------------------------
 
     def wheelEvent(self, event):
+        self._is_fitted = False
         factor = 1.15 ** (event.angleDelta().y() / 120.0)
         self.scale(factor, factor)
 
@@ -1066,15 +1300,22 @@ class FitsView(QGraphicsView):
 class MainWindow(QMainWindow):
     # Emitted from worker thread; queued connection ensures delivery on main thread.
     _stretch_ready = Signal(int, str, object)
+    _buffer_gauge_trigger = Signal()
 
     def __init__(self, fits_path: str | None = None):
         super().__init__()
         self.setWindowTitle("FITS Preview")
         self.setGeometry(QApplication.primaryScreen().availableGeometry())
+        
+        self.main_container = MainContainer()
+        self.setCentralWidget(self.main_container)
+        
         self._fits_files: list[str] = []
         self._bad_files: set[str] = set()
         self._current_index: int    = 0
         self._nav_direction: int    = 1
+        self._current_ahead: int    = 0
+        self._current_behind: int   = 0
         self._stretch_generation: int = 0   # incremented on each navigate; stale
                                             # async results are discarded
 
@@ -1091,6 +1332,7 @@ class MainWindow(QMainWindow):
         self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
         self._stretch_pending: int = 0   # in-flight current-file pipelines (approx)
         self._stretch_ready.connect(self._deliver_stretch)
+        self._buffer_gauge_trigger.connect(self._update_buffer_gauges)
 
         # Saved viewport for the in-flight stretch miss; consumed by _deliver_stretch.
         self._pending_saved_viewport = None
@@ -1105,6 +1347,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key.Key_Space),  self, self._toggle_bad)
         QShortcut(QKeySequence(Qt.Key.Key_Return), self, self._commit_bad_files)
         QShortcut(QKeySequence(Qt.Key.Key_Enter),  self, self._commit_bad_files)
+        QShortcut(QKeySequence(Qt.Key.Key_I),      self, self.main_container.toggle_header_state)
 
         if fits_path:
             self._load_fits(fits_path)
@@ -1183,7 +1426,7 @@ class MainWindow(QMainWindow):
     def _stretch_cache_put(self, path: str, sd: _StretchData):
         self._stretch_cache[path] = sd
         self._stretch_cache.move_to_end(path)
-        while len(self._stretch_cache) > _STRETCH_CACHE_MAX:
+        while len(self._stretch_cache) > _config.config["cache_max"]:
             self._stretch_cache.popitem(last=False)
 
     def _stretch_cache_get(self, path: str) -> _StretchData | None:
@@ -1207,6 +1450,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _trigger_preload(self, ahead: int, behind: int):
+        self._current_ahead = ahead
+        self._current_behind = behind
         if not self._fits_files:
             return
         n = len(self._fits_files)
@@ -1222,43 +1467,10 @@ class MainWindow(QMainWindow):
         for path in wanted:
             if path not in self._stretch_cache and path not in self._preload_futures:
                 future = self._start_pipeline(path)
-                future.add_done_callback(lambda f: QTimer.singleShot(0, self._update_buffer_gauges))
+                future.add_done_callback(lambda f: self._buffer_gauge_trigger.emit())
                 self._preload_futures[path] = future
 
-    def _update_buffer_gauges(self):
-        view = self.centralWidget()
-        if not isinstance(view, FitsView): return
-        
-        if not self._fits_files:
-            view.update_gauges(1.0, 1.0)
-            return
-            
-        def is_buffered(path: str) -> bool:
-            if path in self._stretch_cache:
-                return True
-            f = self._preload_futures.get(path)
-            return f is not None and f.done() and f.exception() is None
-            
-        idx = self._current_index
-        n = len(self._fits_files)
-        
-        back_count = back_expected = 0
-        for i in range(1, _PRELOAD_AHEAD + 1):
-            if idx - i >= 0:
-                back_expected += 1
-                if is_buffered(self._fits_files[idx - i]):
-                    back_count += 1
-                    
-        fwd_count = fwd_expected = 0
-        for i in range(1, _PRELOAD_AHEAD + 1):
-            if idx + i < n:
-                fwd_expected += 1
-                if is_buffered(self._fits_files[idx + i]):
-                    fwd_count += 1
-                    
-        back_pct = 1.0 if back_expected == 0 else back_count / back_expected
-        fwd_pct = 1.0 if fwd_expected == 0 else fwd_count / fwd_expected
-        view.update_gauges(back_pct, fwd_pct)
+
 
     # ------------------------------------------------------------------
     # Loading
@@ -1267,7 +1479,7 @@ class MainWindow(QMainWindow):
     def _show_placeholder(self):
         label = QLabel("Open a FITS file to get started.\n\nUsage: fits-preview <file.fits>")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setCentralWidget(label)
+        self.main_container.set_view(label)
 
     def _load_fits(self, path: str, saved_viewport=None):
         t0       = time.perf_counter()
@@ -1293,15 +1505,15 @@ class MainWindow(QMainWindow):
                 is_bad = abs_path in self._bad_files
                 view = FitsView(stretch.mtf_qimage, stretch,
                                 saved_viewport=vp_to_restore, is_bad=is_bad)
-                self.setCentralWidget(view)
+                self.main_container.set_view(view, stretch.raw_header)
                 _log.debug("_load_fits: displayed in %.1f ms  [%s]  %s",
                            (time.perf_counter() - t0) * 1000, self._queue_info(), name)
             else:
                 # ── MISS: keep current view visible; submit stretch worker ─
                 # Store the saved viewport so _deliver_stretch can restore it.
                 self._pending_saved_viewport = saved_viewport
-                if not isinstance(self.centralWidget(), FitsView):
-                    self.setCentralWidget(LoadingWidget())
+                if not isinstance(self.main_container.get_view(), FitsView):
+                    self.main_container.set_view(LoadingWidget())
 
                 def _on_pipeline_done(future):
                     self._stretch_pending -= 1
@@ -1323,14 +1535,20 @@ class MainWindow(QMainWindow):
             except ValueError:
                 self._current_index = 0
 
-            self._trigger_preload(*(_PRELOAD_HIT if stretch else _PRELOAD_MISS))
+            self._trigger_preload(
+                _config.config["preload_ahead"],
+                _config.config["preload_behind"]
+            )
+            
+            # Immediately update buffer gauges to reflect the loaded view's buffer state
+            self._update_buffer_gauges()
 
             _log.debug("_load_fits: TOTAL %.1f ms  [%s]  %s",
                        (time.perf_counter() - t0) * 1000, self._queue_info(), name)
 
         except Exception as e:
             traceback.print_exc(file=sys.stderr)
-            self.setCentralWidget(QLabel(f"Error loading file:\n{e}"))
+            self.main_container.set_view(QLabel(f"Error loading file:\n{e}"))
 
     def _deliver_stretch(self, gen: int, path: str, sd: _StretchData):
         """Called on the main thread when async stretch build completes."""
@@ -1354,37 +1572,44 @@ class MainWindow(QMainWindow):
                    self._queue_info(), os.path.basename(path))
         is_bad = path in self._bad_files
         view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
-        self.setCentralWidget(view)
+        self.main_container.set_view(view, sd.raw_header)
         self._update_buffer_gauges()
 
     def _update_buffer_gauges(self):
-        view = self.centralWidget()
-        if not isinstance(view, FitsView): return
-        
         if not self._fits_files:
-            view.update_gauges(1.0, 1.0)
+            if self.main_container is not None:
+                self.main_container.update_gauges(1.0, 1.0)
             return
+            
+        def is_buffered(path: str) -> bool:
+            if path in self._stretch_cache:
+                return True
+            f = self._preload_futures.get(path)
+            return f is not None and f.done() and f.exception() is None
             
         idx = self._current_index
         n = len(self._fits_files)
         
-        back_count = back_expected = 0
-        for i in range(1, _PRELOAD_AHEAD + 1):
-            if idx - i >= 0:
-                back_expected += 1
-                if self._fits_files[idx - i] in self._stretch_cache:
-                    back_count += 1
-                    
-        fwd_count = fwd_expected = 0
-        for i in range(1, _PRELOAD_AHEAD + 1):
-            if idx + i < n:
-                fwd_expected += 1
-                if self._fits_files[idx + i] in self._stretch_cache:
-                    fwd_count += 1
-                    
-        back_pct = 1.0 if back_expected == 0 else back_count / back_expected
-        fwd_pct = 1.0 if fwd_expected == 0 else fwd_count / fwd_expected
-        view.update_gauges(back_pct, fwd_pct)
+        ahead = self._current_ahead
+        behind = self._current_behind
+        d = self._nav_direction
+        
+        back_count = 0
+        for i in range(1, behind + 1):
+            if is_buffered(self._fits_files[(idx - d * i) % n]):
+                back_count += 1
+                
+        fwd_count = 0
+        for i in range(1, ahead + 1):
+            if is_buffered(self._fits_files[(idx + d * i) % n]):
+                fwd_count += 1
+                
+        back_pct = back_count / behind if behind > 0 else 1.0
+        fwd_pct = fwd_count / ahead if ahead > 0 else 1.0
+        _log.info("_update_buffer_gauges: back %d/%d (%.2f)  fwd %d/%d (%.2f)",
+                  back_count, behind, back_pct, fwd_count, ahead, fwd_pct)
+        if self.main_container is not None:
+            self.main_container.update_gauges(back_pct, fwd_pct)
 
     def _navigate(self, delta: int):
         if not self._fits_files:
@@ -1392,7 +1617,7 @@ class MainWindow(QMainWindow):
             
         new_idx = self._current_index + delta
         if new_idx < 0 or new_idx >= len(self._fits_files):
-            view = self.centralWidget()
+            view = self.main_container.get_view()
             if isinstance(view, FitsView): view.show_eol()
             return
             
@@ -1410,32 +1635,32 @@ class MainWindow(QMainWindow):
 
     def _auto_stretch(self):
         _log.info("key: Cmd+4 auto-stretch  [%s]", self._queue_info())
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if isinstance(view, FitsView):
             view.auto_stretch()
 
     def _asinh_stretch(self):
         _log.info("key: Cmd+2 asinh-stretch  [%s]", self._queue_info())
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if isinstance(view, FitsView):
             view.apply_asinh_stretch()
 
     def _zscale_stretch(self):
         _log.info("key: Cmd+3 zscale-stretch  [%s]", self._queue_info())
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if isinstance(view, FitsView):
             view.apply_zscale_stretch()
 
     def _mtf_stretch(self):
         _log.info("key: Cmd+1 mtf-stretch  [%s]", self._queue_info())
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if isinstance(view, FitsView):
             view.apply_mtf_stretch()
 
     def _toggle_bad(self):
         if not self._fits_files: return
         path = self._fits_files[self._current_index]
-        view = self.centralWidget()
+        view = self.main_container.get_view()
         if path in self._bad_files:
             self._bad_files.remove(path)
             if isinstance(view, FitsView): view.set_bad(False)
@@ -1475,7 +1700,7 @@ class MainWindow(QMainWindow):
             font = label.font()
             font.setPixelSize(36)
             label.setFont(font)
-            self.setCentralWidget(label)
+            self.main_container.set_view(label, None)
             return
             
         if self._current_index >= len(self._fits_files):
@@ -1586,9 +1811,16 @@ def main():
     parser.add_argument("--out", type=str, help="Output path for the stretched image (required if --headless)")
     parser.add_argument("--stretch", choices=["mtf", "auto", "zscale", "asinh"], default="mtf", 
                         help="Stretch algorithm to use (default: mtf)")
+    parser.add_argument("--ahead", type=int, help="Number of images to preload ahead of the current view")
+    parser.add_argument("--behind", type=int, help="Number of images to keep preloaded behind the current view")
+    parser.add_argument("--cache", type=int, help="Maximum number of fully stretched images to keep in RAM")
     parser.add_argument("--log", action="store_true", help="Log debug output to /tmp/py-fits-preview.log")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging to console")
     args = parser.parse_args()
+    
+    if args.ahead is not None: _config.config["preload_ahead"] = args.ahead
+    if args.behind is not None: _config.config["preload_behind"] = args.behind
+    if args.cache is not None: _config.config["cache_max"] = args.cache
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
