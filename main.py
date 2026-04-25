@@ -35,7 +35,7 @@ def _normalize(arr: np.ndarray,
     vmin/vmax: data values for black/white points (default: 1st/99th percentile).
     gamma: mid-point position as a fraction of [vmin, vmax] (0–1, default 0.5 = linear).
     """
-    a = arr.astype(np.float64)
+    a = arr.astype(np.float32)
     if vmin is None:
         vmin = float(np.nanpercentile(a, 1))
     if vmax is None:
@@ -77,9 +77,9 @@ _BAYER_TO_RGGB_ROLL: dict[str, tuple[int, int]] = {
 
 
 def _debayer_rggb(raw: np.ndarray) -> np.ndarray:
-    """Bilinear demosaicing of a 2-D RGGB array → (H, W, 3) float64."""
+    """Bilinear demosaicing of a 2-D RGGB array → (H, W, 3) float32."""
     h, w = raw.shape
-    d = raw.astype(np.float64)
+    d = raw.astype(np.float32)
     p = np.pad(d, 2, mode="reflect")
 
     def s(dr, dc):
@@ -157,30 +157,6 @@ def fits_data_to_pixmap(data, header=None, vmin=None, vmax=None, gamma=0.5):
     return QPixmap.fromImage(fits_data_to_qimage(data, header, vmin, vmax, gamma))
 
 
-def _load_path_as_qimage(path: str) -> QImage | None:
-    """Load FITS → QImage with auto-stretch. Runs in worker thread."""
-    t0   = time.perf_counter()
-    name = os.path.basename(path)
-    try:
-        t_io = time.perf_counter()
-        with fits.open(path) as hdul:
-            hdu = next((h for h in hdul if h.data is not None
-                        and h.data.ndim >= 2), None)
-            if hdu is None:
-                return None
-            data, header = hdu.data.copy(), hdu.header
-        _log.debug("[worker] _load_path_as_qimage: I/O %.1f ms  %s",
-                   (time.perf_counter() - t_io) * 1000, name)
-        t_conv = time.perf_counter()
-        qi = fits_data_to_qimage(data, header)
-        _log.debug("[worker] _load_path_as_qimage: convert %.1f ms  total %.1f ms  %s",
-                   (time.perf_counter() - t_conv) * 1000,
-                   (time.perf_counter() - t0) * 1000, name)
-        return qi
-    except Exception:
-        _log.exception("[worker] _load_path_as_qimage failed: %s", name)
-        return None
-
 
 def _load_path_raw_data(path: str) -> tuple[np.ndarray, object] | tuple[None, None]:
     """Load raw array + header for histogram/stretch use. Main-thread only."""
@@ -241,7 +217,7 @@ def _build_stretch_data(data: np.ndarray,
     flipped for display, and lo/hi are the data values that map to 0 / 65535.
     """
     t0 = time.perf_counter()
-    d = np.squeeze(data).astype(np.float64)
+    d = np.squeeze(data).astype(np.float32)
 
     bayer = None
     if header is not None:
@@ -350,9 +326,10 @@ def _mtf_stats(samples: np.ndarray,
                 This keeps M in (0, 1) for all m_norm in (0, 1) and
                 ensures the sky background appears at 25% grey, not black.
     """
-    nonzero = samples[samples > 1e-6 * float(samples.max()) + 1e-9]
+    sub    = _subsample(samples)
+    nonzero = sub[sub > 1e-6 * float(sub.max()) + 1e-9]
     if nonzero.size < 100:                          # fall back if almost nothing
-        nonzero = samples
+        nonzero = sub
     med   = float(np.median(nonzero))
     mad   = float(median_abs_deviation(nonzero, scale="normal"))
     black = med + shadow_clip * mad                 # shadow_clip < 0 → below median
@@ -404,7 +381,7 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
     u16 : (H, W, 3) uint16 — globally quantised linear data
     Returns (H, W, 3) uint8.
     """
-    lin = u16.astype(np.float64) / 65535.0   # (H, W, 3), linear [0, 1]
+    lin = u16.astype(np.float32) / 65535.0   # (H, W, 3), linear [0, 1]
 
     # ── Per-channel black points and spans (exclude zero / border pixels) ──
     # _mtf_stats returns the same span used to compute M, so normalization
@@ -456,13 +433,28 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Preload / cache constants
+# Preload / cache / sampling constants
 # ---------------------------------------------------------------------------
 
-_PRELOAD_HIT  = (3, 2)
-_PRELOAD_MISS = (8, 2)
-_POOL_WORKERS = 4
-_CACHE_MAX    = 30
+_PRELOAD_HIT       = (3, 2)
+_PRELOAD_MISS      = (4, 2)
+_POOL_WORKERS      = 2          # see perf notes: 4 workers thrash memory bus
+_STRETCH_CACHE_MAX = 6          # u16 arrays ~121 MB each → ~726 MB max
+_SUBSAMPLE_N       = 500_000    # pixels used for median/MAD/histogram stats
+
+
+def _subsample(arr: np.ndarray, n: int = _SUBSAMPLE_N) -> np.ndarray:
+    """Return a flat random subsample of arr, at most n elements.
+
+    Used for all statistical operations (median, MAD, percentile, histogram)
+    where the full 60M-element array is overkill.  500 K pixels gives
+    statistically equivalent results for sky-background estimation.
+    """
+    flat = arr.ravel()
+    if flat.size <= n:
+        return flat
+    rng = np.random.default_rng(0)   # fixed seed → reproducible stretch
+    return rng.choice(flat, size=n, replace=False)
 
 # ---------------------------------------------------------------------------
 # Directory navigation helpers
@@ -526,7 +518,7 @@ class HistogramOverlay(QWidget):
 
     def set_data(self, data: np.ndarray,
                  vmin: float, vmax: float, gamma: float = 0.5):
-        flat = np.squeeze(data).ravel().astype(np.float64)
+        flat = _subsample(np.squeeze(data).ravel().astype(np.float32))
         flat = flat[np.isfinite(flat)]
         if flat.size == 0:
             return
@@ -674,12 +666,57 @@ class HistogramOverlay(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Stretch data container
+# ---------------------------------------------------------------------------
+
+class _StretchData:
+    """Holds the pre-quantised u16 array and associated metadata needed for
+    interactive stretch.  Kept separate from QImage so the two can be cached
+    and delivered independently (QImage for immediate display, u16 for controls).
+    """
+    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage")
+
+    def __init__(self, u16: np.ndarray, lo: float, hi: float,
+                 raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None):
+        self.u16        = u16         # (H, W) or (H, W, 3) uint16, flipped
+        self.lo         = lo          # data value → u16 == 0
+        self.hi         = hi          # data value → u16 == 65535
+        self.raw_flat   = raw_flat    # float32 flat of pre-debayer data for histogram
+        self.mtf_qimage = mtf_qimage  # pre-rendered MTF QImage for instant cache-hit display
+
+
+def _compute_stretch_data(path: str) -> "_StretchData | None":
+    """Full pipeline: load → build u16 → render MTF QImage.  Thread-safe.
+
+    Used by both the stretch executor (current file) and the preload pool
+    (adjacent files).  Returns None on any error.
+    """
+    name = os.path.basename(path)
+    t0 = time.perf_counter()
+    raw_data, raw_header = _load_path_raw_data(path)
+    if raw_data is None:
+        return None
+    u16, lo, hi = _build_stretch_data(raw_data, raw_header)
+    raw_flat = _subsample(np.squeeze(raw_data).ravel().astype(np.float32))
+    t_mtf = time.perf_counter()
+    if u16.ndim == 2:
+        lut    = _compute_mtf_lut(u16.ravel())
+        mtf_qi = _gray_to_qimage(lut[u16])
+    else:
+        mtf_qi = _rgb_to_qimage(_apply_mtf_color(u16))
+    _log.debug("[worker] _compute_stretch_data: MTF %.1f ms  total %.1f ms  %s",
+               (time.perf_counter() - t_mtf) * 1000,
+               (time.perf_counter() - t0) * 1000, name)
+    return _StretchData(u16, lo, hi, raw_flat, mtf_qi)
+
+
+# ---------------------------------------------------------------------------
 # Qt widgets
 # ---------------------------------------------------------------------------
 
 class FitsView(QGraphicsView):
     def __init__(self, qimage: QImage,
-                 raw_data: np.ndarray | None, header,
+                 stretch: _StretchData | None = None,
                  saved_viewport=None, parent=None):
         pixmap = QPixmap.fromImage(qimage)
         super().__init__(parent)
@@ -700,41 +737,53 @@ class FitsView(QGraphicsView):
         self._fit_pending    = False
         self._initial_fit_done = saved_viewport is not None
 
-        # Stretch data: pre-quantised uint16 for fast LUT application.
-        # _stretch_u16: (H, W) or (H, W, 3) uint16, already flipped for display.
-        # _stretch_lo/hi: data values mapped to u16 0 / 65535.
-        # _raw_flat: float32 flat view of raw data kept for histogram redraws.
-        t0 = time.perf_counter()
-        if raw_data is not None:
-            self._stretch_u16, self._stretch_lo, self._stretch_hi = \
-                _build_stretch_data(raw_data, header)
-            self._raw_flat = np.squeeze(raw_data).ravel().astype(np.float32)
-            self._vmin  = float(np.nanpercentile(self._raw_flat, 1))
-            self._vmax  = float(np.nanpercentile(self._raw_flat, 99))
-            self._auto_vmin = self._vmin
-            self._auto_vmax = self._vmax
-        else:
-            self._stretch_u16 = None
-            self._raw_flat = None
-            self._stretch_lo, self._stretch_hi = 0.0, 1.0
-            self._vmin, self._vmax = 0.0, 1.0
-            self._auto_vmin, self._auto_vmax = 0.0, 1.0
-        self._gamma = 0.5
-        _log.debug("FitsView.__init__: build_stretch_data %.1f ms",
-                   (time.perf_counter() - t0) * 1000)
+        self._stretch_u16  = None
+        self._stretch_lo   = 0.0
+        self._stretch_hi   = 1.0
+        self._raw_flat     = None
+        self._vmin         = 0.0
+        self._vmax         = 1.0
+        self._auto_vmin    = 0.0
+        self._auto_vmax    = 1.0
+        self._gamma        = 0.5
 
         # Histogram overlay — child of the viewport so it stays fixed on screen
-        t_hist = time.perf_counter()
         self._histogram = HistogramOverlay(self.viewport())
-        if raw_data is not None:
-            self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
         self._histogram.stretch_changed.connect(self._on_stretch_changed)
-        _log.debug("FitsView.__init__: histogram init %.1f ms",
-                   (time.perf_counter() - t_hist) * 1000)
+
+        if stretch is not None:
+            self._install_stretch(stretch)
 
         # Shortcuts (Ctrl→Cmd on macOS)
         QShortcut(QKeySequence("Ctrl+0"), self, self._zoom_one_to_one)
         QShortcut(QKeySequence("Ctrl+9"), self, self._fit)
+
+    def _install_stretch(self, stretch: _StretchData):
+        """Apply a _StretchData object — called at init time or asynchronously."""
+        t0 = time.perf_counter()
+        self._stretch_u16 = stretch.u16
+        self._stretch_lo  = stretch.lo
+        self._stretch_hi  = stretch.hi
+        self._raw_flat    = stretch.raw_flat
+        sub = _subsample(self._raw_flat)
+        self._vmin = float(np.nanpercentile(sub, 1))
+        self._vmax = float(np.nanpercentile(sub, 99))
+        self._auto_vmin = self._vmin
+        self._auto_vmax = self._vmax
+        _log.debug("FitsView._install_stretch: stats %.1f ms",
+                   (time.perf_counter() - t0) * 1000)
+        t_hist = time.perf_counter()
+        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
+        _log.debug("FitsView._install_stretch: histogram %.1f ms",
+                   (time.perf_counter() - t_hist) * 1000)
+        if stretch.mtf_qimage is not None:
+            self._item.setPixmap(QPixmap.fromImage(stretch.mtf_qimage))
+        else:
+            self.apply_mtf_stretch()
+
+    def set_stretch_data(self, stretch: _StretchData):
+        """Deliver stretch data that arrived asynchronously after init."""
+        self._install_stretch(stretch)
 
     # ------------------------------------------------------------------
     # Viewport state (preserved across navigation)
@@ -907,6 +956,9 @@ class FitsView(QGraphicsView):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
+    # Emitted from worker thread; queued connection ensures delivery on main thread.
+    _stretch_ready = Signal(int, str, object)
+
     def __init__(self, fits_path: str | None = None):
         super().__init__()
         self.setWindowTitle("FITS Preview")
@@ -914,19 +966,32 @@ class MainWindow(QMainWindow):
         self._fits_files: list[str] = []
         self._current_index: int    = 0
         self._nav_direction: int    = 1
+        self._stretch_generation: int = 0   # incremented on each navigate; stale
+                                            # async results are discarded
 
-        self._cache: OrderedDict[str, QImage] = OrderedDict()
+        # Preload pool — runs _compute_stretch_data for adjacent files.
+        # Results are harvested into _stretch_cache via _stretch_cache_get.
         self._preload_futures: dict[str, Future] = {}
         self._executor = ThreadPoolExecutor(max_workers=_POOL_WORKERS,
                                             thread_name_prefix="fits-preload")
 
+        # Stretch data cache (u16 + MTF QImage) for both current and preloaded files.
+        self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
+        self._stretch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fits-stretch")
+        self._stretch_pending: int = 0   # in-flight stretch jobs (approx, for logging)
+        self._stretch_ready.connect(self._deliver_stretch)
+
+        # Saved viewport for the in-flight stretch miss; consumed by _deliver_stretch.
+        self._pending_saved_viewport = None
+
         # Window-level shortcuts (fire even when FitsView has focus)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self._navigate(+1))
         QShortcut(QKeySequence(Qt.Key.Key_Left),  self, lambda: self._navigate(-1))
-        QShortcut(QKeySequence("Ctrl+1"),          self, self._auto_stretch)
+        QShortcut(QKeySequence("Ctrl+1"),          self, self._mtf_stretch)
         QShortcut(QKeySequence("Ctrl+2"),          self, self._asinh_stretch)
         QShortcut(QKeySequence("Ctrl+3"),          self, self._zscale_stretch)
-        QShortcut(QKeySequence("Ctrl+4"),          self, self._mtf_stretch)
+        QShortcut(QKeySequence("Ctrl+4"),          self, self._auto_stretch)
 
         if fits_path:
             self._load_fits(fits_path)
@@ -934,28 +999,36 @@ class MainWindow(QMainWindow):
             self._show_placeholder()
 
     # ------------------------------------------------------------------
-    # Cache helpers (main-thread only)
+    # Queue diagnostics
     # ------------------------------------------------------------------
 
-    def _cache_put(self, path: str, image: QImage):
-        self._cache[path] = image
-        self._cache.move_to_end(path)
-        while len(self._cache) > _CACHE_MAX:
-            self._cache.popitem(last=False)
+    def _queue_info(self) -> str:
+        return f"preload:{len(self._preload_futures)} stretch:{self._stretch_pending}"
 
-    def _cache_get(self, path: str) -> QImage | None:
+    # ------------------------------------------------------------------
+    # Stretch data cache helpers (main-thread only)
+    # ------------------------------------------------------------------
+
+    def _stretch_cache_put(self, path: str, sd: _StretchData):
+        self._stretch_cache[path] = sd
+        self._stretch_cache.move_to_end(path)
+        while len(self._stretch_cache) > _STRETCH_CACHE_MAX:
+            self._stretch_cache.popitem(last=False)
+
+    def _stretch_cache_get(self, path: str) -> _StretchData | None:
+        # Harvest any completed preload futures first.
         future = self._preload_futures.get(path)
         if future is not None and future.done():
             self._preload_futures.pop(path)
             try:
                 r = future.result()
                 if r is not None:
-                    self._cache_put(path, r)
+                    self._stretch_cache_put(path, r)
             except Exception:
                 pass
-        if path in self._cache:
-            self._cache.move_to_end(path)
-            return self._cache[path]
+        if path in self._stretch_cache:
+            self._stretch_cache.move_to_end(path)
+            return self._stretch_cache[path]
         return None
 
     # ------------------------------------------------------------------
@@ -976,9 +1049,9 @@ class MainWindow(QMainWindow):
             if path not in wanted:
                 self._preload_futures.pop(path).cancel()
         for path in wanted:
-            if path not in self._cache and path not in self._preload_futures:
+            if path not in self._stretch_cache and path not in self._preload_futures:
                 self._preload_futures[path] = self._executor.submit(
-                    _load_path_as_qimage, path)
+                    _compute_stretch_data, path)
 
     # ------------------------------------------------------------------
     # Loading
@@ -994,68 +1067,92 @@ class MainWindow(QMainWindow):
         abs_path = os.path.abspath(path)
         name     = os.path.basename(abs_path)
         self.setWindowTitle(f"FITS Preview — {name}")
+        self._stretch_generation += 1
+        gen = self._stretch_generation
         try:
-            # QImage from cache or fresh load
-            qimage    = self._cache_get(abs_path)
-            cache_hit = qimage is not None
-            _log.debug("_load_fits: cache %s  %s", "HIT" if cache_hit else "MISS", name)
-            if qimage is None:
-                future = self._preload_futures.pop(abs_path, None)
-                if future is not None:
-                    future.cancel()
-                t_qi = time.perf_counter()
-                qimage = _load_path_as_qimage(abs_path)
-                _log.debug("_load_fits: fresh load %.1f ms  %s",
-                           (time.perf_counter() - t_qi) * 1000, name)
-                if qimage is None:
-                    self.setCentralWidget(
-                        QLabel(f"No image data found in:\n{abs_path}"))
-                    return
-            self._cache_put(abs_path, qimage)
+            # ── Step 1: Check stretch cache (includes harvesting preloads) ─
+            stretch = self._stretch_cache_get(abs_path)
+            _log.debug("_load_fits: stretch %s  [%s]  %s",
+                       "HIT" if stretch else "MISS (async)", self._queue_info(), name)
 
-            # Raw data always loaded for histogram / stretch
-            t_raw = time.perf_counter()
-            raw_data, raw_header = _load_path_raw_data(abs_path)
-            _log.debug("_load_fits: raw_data load %.1f ms  %s",
-                       (time.perf_counter() - t_raw) * 1000, name)
+            if stretch is not None:
+                # ── HIT: build FitsView with pre-rendered MTF image ───────
+                pixmap = QPixmap.fromImage(stretch.mtf_qimage)
+                vp_to_restore = None
+                if saved_viewport is not None:
+                    _, _, old_size = saved_viewport
+                    if old_size == (pixmap.width(), pixmap.height()):
+                        vp_to_restore = (saved_viewport[0], saved_viewport[1])
+                view = FitsView(stretch.mtf_qimage, stretch,
+                                saved_viewport=vp_to_restore)
+                self.setCentralWidget(view)
+                _log.debug("_load_fits: displayed in %.1f ms  [%s]  %s",
+                           (time.perf_counter() - t0) * 1000, self._queue_info(), name)
+            else:
+                # ── MISS: keep current view visible; submit stretch worker ─
+                # Store the saved viewport so _deliver_stretch can restore it.
+                self._pending_saved_viewport = saved_viewport
+                if not isinstance(self.centralWidget(), FitsView):
+                    self.setCentralWidget(QLabel("Loading…"))
 
-            # Viewport restore
-            pixmap = QPixmap.fromImage(qimage)
-            vp_to_restore = None
-            if saved_viewport is not None:
-                _, _, old_size = saved_viewport
-                if old_size == (pixmap.width(), pixmap.height()):
-                    vp_to_restore = (saved_viewport[0], saved_viewport[1])
+                def _on_stretch_done(future):
+                    self._stretch_pending -= 1
+                    try:
+                        sd = future.result()
+                    except Exception:
+                        _log.exception("stretch worker failed: %s", name)
+                        return
+                    if sd is not None:
+                        self._stretch_ready.emit(gen, abs_path, sd)
 
-            t_view = time.perf_counter()
-            view = FitsView(qimage, raw_data, raw_header,
-                            saved_viewport=vp_to_restore)
-            _log.debug("_load_fits: FitsView() %.1f ms  %s",
-                       (time.perf_counter() - t_view) * 1000, name)
+                self._stretch_pending += 1
+                self._stretch_executor.submit(
+                    _compute_stretch_data, abs_path
+                ).add_done_callback(_on_stretch_done)
 
-            t_sw = time.perf_counter()
-            self.setCentralWidget(view)
-            _log.debug("_load_fits: setCentralWidget %.1f ms  %s",
-                       (time.perf_counter() - t_sw) * 1000, name)
-
+            # ── Step 2: Directory index + preload ─────────────────────────
             self._fits_files = _fits_siblings(abs_path)
             try:
                 self._current_index = self._fits_files.index(abs_path)
             except ValueError:
                 self._current_index = 0
 
-            ahead, behind = _PRELOAD_HIT if cache_hit else _PRELOAD_MISS
-            self._trigger_preload(ahead, behind)
+            self._trigger_preload(*(_PRELOAD_HIT if stretch else _PRELOAD_MISS))
 
-            _log.debug("_load_fits: TOTAL %.1f ms  %s", (time.perf_counter() - t0) * 1000, name)
+            _log.debug("_load_fits: TOTAL %.1f ms  [%s]  %s",
+                       (time.perf_counter() - t0) * 1000, self._queue_info(), name)
 
         except Exception as e:
             traceback.print_exc(file=sys.stderr)
             self.setCentralWidget(QLabel(f"Error loading file:\n{e}"))
 
+    def _deliver_stretch(self, gen: int, path: str, sd: _StretchData):
+        """Called on the main thread when async stretch build completes."""
+        if gen != self._stretch_generation:
+            _log.debug("_deliver_stretch: stale gen %d (current %d), discarding [%s]  %s",
+                       gen, self._stretch_generation, self._queue_info(),
+                       os.path.basename(path))
+            return
+        self._stretch_cache_put(path, sd)
+
+        # Resolve the saved viewport now that we know the image dimensions.
+        saved_vp = self._pending_saved_viewport
+        self._pending_saved_viewport = None
+        vp_to_restore = None
+        if saved_vp is not None:
+            _, _, old_size = saved_vp
+            if old_size == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
+                vp_to_restore = (saved_vp[0], saved_vp[1])
+
+        _log.debug("_deliver_stretch: installing [%s]  %s",
+                   self._queue_info(), os.path.basename(path))
+        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore)
+        self.setCentralWidget(view)
+
     def _navigate(self, delta: int):
         if not self._fits_files:
             return
+        _log.debug("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
         t0 = time.perf_counter()
         self._nav_direction = 1 if delta > 0 else -1
         saved_vp = None
@@ -1063,26 +1160,30 @@ class MainWindow(QMainWindow):
         if isinstance(view, FitsView):
             saved_vp = view.viewport_state()
         self._current_index = (self._current_index + delta) % len(self._fits_files)
-        _log.debug("_navigate: delta=%+d → index %d", delta, self._current_index)
         self._load_fits(self._fits_files[self._current_index], saved_viewport=saved_vp)
-        _log.debug("_navigate: TOTAL %.1f ms", (time.perf_counter() - t0) * 1000)
+        _log.debug("_navigate: TOTAL %.1f ms  [%s]", (time.perf_counter() - t0) * 1000,
+                   self._queue_info())
 
     def _auto_stretch(self):
+        _log.debug("key: Cmd+4 auto-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.auto_stretch()
 
     def _asinh_stretch(self):
+        _log.debug("key: Cmd+2 asinh-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_asinh_stretch()
 
     def _zscale_stretch(self):
+        _log.debug("key: Cmd+3 zscale-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_zscale_stretch()
 
     def _mtf_stretch(self):
+        _log.debug("key: Cmd+1 mtf-stretch  [%s]", self._queue_info())
         view = self.centralWidget()
         if isinstance(view, FitsView):
             view.apply_mtf_stretch()
