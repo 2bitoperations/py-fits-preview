@@ -438,7 +438,7 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
 
 _PRELOAD_HIT       = (3, 2)
 _PRELOAD_MISS      = (4, 2)
-_POOL_WORKERS      = 2          # see perf notes: 4 workers thrash memory bus
+_COMPUTE_WORKERS   = 4          # CPU workers for debayer + quantize + MTF
 _STRETCH_CACHE_MAX = 6          # u16 arrays ~121 MB each → ~726 MB max
 _SUBSAMPLE_N       = 500_000    # pixels used for median/MAD/histogram stats
 
@@ -685,17 +685,15 @@ class _StretchData:
         self.mtf_qimage = mtf_qimage  # pre-rendered MTF QImage for instant cache-hit display
 
 
-def _compute_stretch_data(path: str) -> "_StretchData | None":
-    """Full pipeline: load → build u16 → render MTF QImage.  Thread-safe.
+def _compute_from_raw(path: str, raw_data: np.ndarray,
+                      raw_header) -> "_StretchData | None":
+    """Compute stage: debayer + quantize + MTF render.  Runs in compute pool.
 
-    Used by both the stretch executor (current file) and the preload pool
-    (adjacent files).  Returns None on any error.
+    Receives raw FITS data already loaded from disk by the I/O worker.
+    Returns None on any error.
     """
     name = os.path.basename(path)
     t0 = time.perf_counter()
-    raw_data, raw_header = _load_path_raw_data(path)
-    if raw_data is None:
-        return None
     u16, lo, hi = _build_stretch_data(raw_data, raw_header)
     raw_flat = _subsample(np.squeeze(raw_data).ravel().astype(np.float32))
     t_mtf = time.perf_counter()
@@ -704,7 +702,8 @@ def _compute_stretch_data(path: str) -> "_StretchData | None":
         mtf_qi = _gray_to_qimage(lut[u16])
     else:
         mtf_qi = _rgb_to_qimage(_apply_mtf_color(u16))
-    _log.debug("[worker] _compute_stretch_data: MTF %.1f ms  total %.1f ms  %s",
+    _log.debug("[compute] debayer+quantize %.1f ms  MTF %.1f ms  total %.1f ms  %s",
+               (t_mtf - t0) * 1000,
                (time.perf_counter() - t_mtf) * 1000,
                (time.perf_counter() - t0) * 1000, name)
     return _StretchData(u16, lo, hi, raw_flat, mtf_qi)
@@ -969,17 +968,18 @@ class MainWindow(QMainWindow):
         self._stretch_generation: int = 0   # incremented on each navigate; stale
                                             # async results are discarded
 
-        # Preload pool — runs _compute_stretch_data for adjacent files.
-        # Results are harvested into _stretch_cache via _stretch_cache_get.
+        # Two-stage pipeline: one I/O worker serialises all disk reads;
+        # multiple compute workers handle debayer + quantize + MTF in parallel.
+        # _preload_futures stores pipeline Future objects (see _start_pipeline).
         self._preload_futures: dict[str, Future] = {}
-        self._executor = ThreadPoolExecutor(max_workers=_POOL_WORKERS,
-                                            thread_name_prefix="fits-preload")
+        self._io_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="fits-io")
+        self._compute_executor = ThreadPoolExecutor(
+            max_workers=_COMPUTE_WORKERS, thread_name_prefix="fits-compute")
 
         # Stretch data cache (u16 + MTF QImage) for both current and preloaded files.
         self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
-        self._stretch_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fits-stretch")
-        self._stretch_pending: int = 0   # in-flight stretch jobs (approx, for logging)
+        self._stretch_pending: int = 0   # in-flight current-file pipelines (approx)
         self._stretch_ready.connect(self._deliver_stretch)
 
         # Saved viewport for the in-flight stretch miss; consumed by _deliver_stretch.
@@ -1004,6 +1004,60 @@ class MainWindow(QMainWindow):
 
     def _queue_info(self) -> str:
         return f"preload:{len(self._preload_futures)} stretch:{self._stretch_pending}"
+
+    # ------------------------------------------------------------------
+    # Two-stage I/O → compute pipeline
+    # ------------------------------------------------------------------
+
+    def _start_pipeline(self, path: str) -> Future:
+        """Submit path through the single I/O worker then the compute pool.
+
+        Returns a Future that resolves to _StretchData | None once both
+        stages complete.  Call .cancel() to abandon; in-progress I/O cannot
+        be interrupted but the compute stage will not start if the future
+        is already cancelled when I/O finishes.
+        """
+        result_future: Future = Future()
+        name = os.path.basename(path)
+
+        def _on_io_done(io_future):
+            if result_future.cancelled():
+                return
+            try:
+                raw_data, raw_header = io_future.result()
+            except Exception as exc:
+                _log.exception("[io] failed: %s", name)
+                try:
+                    result_future.set_exception(exc)
+                except Exception:
+                    pass
+                return
+            if raw_data is None:
+                try:
+                    result_future.set_result(None)
+                except Exception:
+                    pass
+                return
+            _log.debug("[io] done → compute  %s", name)
+            compute_future = self._compute_executor.submit(
+                _compute_from_raw, path, raw_data, raw_header)
+            compute_future.add_done_callback(_on_compute_done)
+
+        def _on_compute_done(compute_future):
+            if result_future.cancelled():
+                return
+            try:
+                result_future.set_result(compute_future.result())
+            except Exception as exc:
+                try:
+                    result_future.set_exception(exc)
+                except Exception:
+                    pass
+
+        _log.debug("[io] queued  [%s]  %s", self._queue_info(), name)
+        io_future = self._io_executor.submit(_load_path_raw_data, path)
+        io_future.add_done_callback(_on_io_done)
+        return result_future
 
     # ------------------------------------------------------------------
     # Stretch data cache helpers (main-thread only)
@@ -1050,8 +1104,7 @@ class MainWindow(QMainWindow):
                 self._preload_futures.pop(path).cancel()
         for path in wanted:
             if path not in self._stretch_cache and path not in self._preload_futures:
-                self._preload_futures[path] = self._executor.submit(
-                    _compute_stretch_data, path)
+                self._preload_futures[path] = self._start_pipeline(path)
 
     # ------------------------------------------------------------------
     # Loading
@@ -1095,20 +1148,18 @@ class MainWindow(QMainWindow):
                 if not isinstance(self.centralWidget(), FitsView):
                     self.setCentralWidget(QLabel("Loading…"))
 
-                def _on_stretch_done(future):
+                def _on_pipeline_done(future):
                     self._stretch_pending -= 1
                     try:
                         sd = future.result()
                     except Exception:
-                        _log.exception("stretch worker failed: %s", name)
+                        _log.exception("pipeline failed: %s", name)
                         return
                     if sd is not None:
                         self._stretch_ready.emit(gen, abs_path, sd)
 
                 self._stretch_pending += 1
-                self._stretch_executor.submit(
-                    _compute_stretch_data, abs_path
-                ).add_done_callback(_on_stretch_done)
+                self._start_pipeline(abs_path).add_done_callback(_on_pipeline_done)
 
             # ── Step 2: Directory index + preload ─────────────────────────
             self._fits_files = _fits_siblings(abs_path)
