@@ -5,15 +5,17 @@ import threading
 import time
 import traceback
 import argparse
+import json
+import re
 import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import cv2
 import numpy as np
 
+import compute_backend
 import ipc
-
-_log = logging.getLogger(__name__)
 from astropy.io import fits
 from astropy.visualization import ZScaleInterval
 from PySide6.QtWidgets import (
@@ -24,38 +26,16 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
-    QPainter, QColor, QPen, QBrush, QPolygon,
+    QPainter, QColor, QPen, QBrush,
 )
-from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPoint, QPropertyAnimation, QRectF
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPropertyAnimation, QRectF, Property
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Image conversion helpers
 # ---------------------------------------------------------------------------
-
-def _normalize(arr: np.ndarray,
-               vmin: float | None = None,
-               vmax: float | None = None,
-               gamma: float = 0.5) -> np.ndarray:
-    """Stretch arr → uint8.
-
-    vmin/vmax: data values for black/white points (default: 1st/99th percentile).
-    gamma: mid-point position as a fraction of [vmin, vmax] (0–1, default 0.5 = linear).
-    """
-    a = arr.astype(np.float32)
-    if vmin is None:
-        vmin = float(np.nanpercentile(a, 1))
-    if vmax is None:
-        vmax = float(np.nanpercentile(a, 99))
-    if vmax == vmin:
-        vmax = vmin + 1.0
-    t = np.clip((a - vmin) / (vmax - vmin), 0.0, 1.0)
-    if abs(gamma - 0.5) > 1e-4:
-        g = float(np.clip(gamma, 1e-6, 1.0 - 1e-6))
-        exp = np.log(0.5) / np.log(g)
-        t = np.power(np.maximum(t, 0.0), exp)
-    return (t * 255.0).astype(np.uint8)
-
 
 def _gray_to_qimage(gray: np.ndarray) -> QImage:
     """(H, W) uint8 → QImage grayscale. Thread-safe."""
@@ -107,53 +87,6 @@ def _debayer(raw: np.ndarray, pattern: str) -> np.ndarray:
         raw = np.clip(raw, 0, 65535).astype(np.uint16)
     bgr = cv2.cvtColor(raw, code)
     return np.ascontiguousarray(bgr[:, :, ::-1]).astype(np.float32)  # BGR → RGB
-
-
-# ---------------------------------------------------------------------------
-# Main conversion entry point
-# ---------------------------------------------------------------------------
-
-def fits_data_to_qimage(data: np.ndarray,
-                        header=None,
-                        vmin: float | None = None,
-                        vmax: float | None = None,
-                        gamma: float = 0.5) -> QImage:
-    """Convert FITS data → QImage. Thread-safe.
-
-    With vmin/vmax=None uses per-channel auto-stretch (preload path).
-    With explicit vmin/vmax applies global stretch to all channels.
-    """
-    data = np.squeeze(data)
-
-    if data.ndim == 3:
-        if data.shape[0] == 3:
-            channels = [data[i] for i in range(3)]
-        elif data.shape[2] == 3:
-            channels = [data[:, :, i] for i in range(3)]
-        else:
-            return fits_data_to_qimage(data[0], header, vmin, vmax, gamma)
-        rgb = np.stack([_normalize(c, vmin, vmax, gamma) for c in channels], axis=-1)
-        return _rgb_to_qimage(np.flipud(rgb))
-
-    if data.ndim == 2:
-        bayer = None
-        if header is not None:
-            bayer = (header.get("BAYERPAT") or
-                     header.get("COLORTYP") or
-                     header.get("BAYER"))
-        if bayer and str(bayer).upper().strip() in _BAYER_CV2_CODE:
-            rgb_f = _debayer(data, str(bayer))
-            rgb = np.stack([_normalize(rgb_f[:, :, i], vmin, vmax, gamma)
-                            for i in range(3)], axis=-1)
-            return _rgb_to_qimage(np.flipud(rgb))
-        return _gray_to_qimage(np.flipud(_normalize(data, vmin, vmax, gamma)))
-
-    raise ValueError(f"Cannot display data with shape {data.shape}")
-
-
-def fits_data_to_pixmap(data, header=None, vmin=None, vmax=None, gamma=0.5):
-    return QPixmap.fromImage(fits_data_to_qimage(data, header, vmin, vmax, gamma))
-
 
 
 def _load_path_raw_data(path: str) -> tuple[np.ndarray, object] | tuple[None, None]:
@@ -264,9 +197,9 @@ def _build_stretch_data(data: np.ndarray,
     try:
         d_plane = d[:, :, 1] if d.ndim == 3 and d.shape[2] == 3 else d[:, :, 0] if d.ndim == 3 else d
         
-        # We already extracted a random subsample for quantisation logic. 
-        # Use its 99.5th percentile to threshold the full image plane.
-        sub_c = _subsample(d_plane.ravel())
+        # Threshold at the 99.5th percentile (estimated from a subsample),
+        # then keep star-sized connected blobs.
+        sub_c = _subsample(d_plane)
         if sub_c.size > 0:
             thresh = float(np.nanpercentile(sub_c, 99.5))
             mask = (d_plane > thresh).astype(np.uint8)
@@ -276,12 +209,16 @@ def _build_stretch_data(data: np.ndarray,
             valid = (areas > 4) & (areas < 150)
             valid[0] = False # Ignore vast background blob
             
+            # Labels come out in raster order, so taking the first N would
+            # measure only the top edge of the frame (worst optics).  Take N
+            # evenly spaced through the list instead -> spread over all rows.
             valid_centroids = centroids[valid]
-            if len(valid_centroids) > 50:
-                valid_centroids = valid_centroids[:50]
+            if len(valid_centroids) > _FWHM_MAX_STARS:
+                pick = np.linspace(0, len(valid_centroids) - 1, _FWHM_MAX_STARS).astype(np.intp)
+                valid_centroids = valid_centroids[pick]
                 
             if len(valid_centroids) > 0:
-                fwhm = compute_backend.estimate_fwhm(d_plane, valid_centroids.astype(np.int32))
+                fwhm = compute_backend.estimate_fwhm(d_plane, np.rint(valid_centroids).astype(np.int32))
     except Exception as e:
         _log.error("FWHM estimation failed: %s", e)
         
@@ -366,7 +303,7 @@ def _mtf_stats(samples: np.ndarray,
                 This keeps M in (0, 1) for all m_norm in (0, 1) and
                 ensures the sky background appears at 25% grey, not black.
     """
-    sub    = _subsample(samples)
+    sub    = _subsample(samples).astype(np.float64)   # sample first, then cast
     nonzero = sub[sub > 1e-6 * float(sub.max()) + 1e-9]
     if nonzero.size < 100:                          # fall back if almost nothing
         nonzero = sub
@@ -391,14 +328,12 @@ def _compute_mtf_lut(u16_flat: np.ndarray) -> np.ndarray:
     Uses the same span that _mtf_stats used to compute M — essential so the
     LUT normalization is consistent with the M value.
     """
-    black, span, M = _mtf_stats(u16_flat.astype(np.float64))
+    black, span, M = _mtf_stats(u16_flat)
     _log.debug("_compute_mtf_lut: black=%.1f  span=%.1f  M=%.5f", black, span, M)
     idx = np.arange(65536, dtype=np.float64)
     t   = np.clip((idx - black) / span, 0.0, 1.0)
     return (_mtf_rational(t, M) * 255.0).astype(np.uint8)
 
-
-import compute_backend
 
 def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
     """Per-channel unlinked MTF with luminance-based colour preservation.
@@ -455,6 +390,7 @@ def _apply_mtf_color(u16: np.ndarray) -> np.ndarray:
 
 _COMPUTE_WORKERS   = 4          # CPU workers for debayer + quantize + MTF
 _SUBSAMPLE_N       = 500_000    # pixels used for median/MAD/histogram stats
+_FWHM_MAX_STARS    = 200        # stars measured per frame for the FWHM gauge
 _GLOBAL_RNG        = np.random.default_rng(0)
 
 
@@ -547,8 +483,6 @@ class _IoScheduler:
 _FITS_EXTENSIONS = frozenset({".fits", ".fit", ".fts"})
 
 
-import re
-
 def _natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
 
@@ -607,7 +541,7 @@ class HistogramOverlay(QWidget):
 
     def set_data(self, data: np.ndarray,
                  vmin: float, vmax: float, gamma: float = 0.5):
-        flat = _subsample(np.squeeze(data).ravel().astype(np.float32))
+        flat = _subsample(np.squeeze(data)).astype(np.float32)
         flat = flat[np.isfinite(flat)]
         if flat.size == 0:
             return
@@ -750,7 +684,8 @@ class _StretchData:
     interactive stretch.  Kept separate from QImage so the two can be cached
     and delivered independently (QImage for immediate display, u16 for controls).
     """
-    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb", "raw_header", "fwhm")
+    __slots__ = ("u16", "lo", "hi", "raw_flat", "mtf_qimage", "mtf_rgb", "raw_header", "fwhm",
+                 "nbytes")
 
     def __init__(self, u16: np.ndarray, lo: float, hi: float,
                  raw_flat: np.ndarray, mtf_qimage: "QImage | None" = None,
@@ -764,6 +699,9 @@ class _StretchData:
         self.mtf_rgb    = mtf_rgb     # raw uint8 array for headless mode
         self.raw_header = raw_header
         self.fwhm       = fwhm
+        self.nbytes     = (u16.nbytes + raw_flat.nbytes
+                           + (mtf_qimage.sizeInBytes() if mtf_qimage is not None else 0)
+                           + (mtf_rgb.nbytes if mtf_rgb is not None else 0))
 
 
 def _compute_from_raw(path: str, raw_data: np.ndarray,
@@ -776,7 +714,7 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
     name = os.path.basename(path)
     t0 = time.perf_counter()
     u16, lo, hi, fwhm = _build_stretch_data(raw_data, raw_header)
-    raw_flat = _subsample(np.squeeze(raw_data).ravel().astype(np.float32))
+    raw_flat = _subsample(np.squeeze(raw_data)).astype(np.float32)
     t_mtf = time.perf_counter()
     if u16.ndim == 2:
         lut    = _compute_mtf_lut(u16.ravel())
@@ -796,11 +734,6 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
     return _StretchData(u16, lo, hi, raw_flat, mtf_qi,
                         mtf_rgb if headless else None,
                         dict(raw_header), fwhm=fwhm)
-
-import json
-from pathlib import Path
-
-import os
 
 class ConfigManager:
     def __init__(self):
@@ -834,8 +767,7 @@ class ConfigManager:
         except Exception:
             ram_bytes = 16 * 1024**3
         
-        allowed = int((ram_bytes * 0.10) / (121 * 1024**2))
-        allowed = max(5, allowed)
+        self.ram_bytes = ram_bytes
 
         # Preloads are read nearest-first, so a deep window costs nothing in
         # responsiveness; it just keeps the link busy.  Back-and-forth review
@@ -849,18 +781,21 @@ class ConfigManager:
             "checked_headers": [],
             "preload_ahead": ahead,
             "preload_behind": behind,
-            # Total stretched images held in RAM.  Never smaller than the
-            # preload window (enforced again in MainWindow); the extra slots
-            # keep recently-viewed images that fell out of the window.
-            "cache_max": max(allowed, ahead + behind + 1),
+            # Cache limits: an image count and a fraction of physical RAM
+            # (measured from the real per-image size, which varies a lot by
+            # camera and binning).  Out-of-window images are evicted when
+            # either is exceeded; the preload window itself is always kept.
+            "cache_max": 100,
+            "cache_ram_fraction": 0.10,
             "histogram_visible": True
         }
         self._file_keys: set[str] = set()
         self.load()
 
-    # RAM-derived defaults: only persisted if the user put them in the file,
-    # so saving a UI toggle doesn't freeze today's defaults forever.
-    _DERIVED_KEYS = frozenset({"preload_ahead", "preload_behind", "cache_max"})
+    # Tuning defaults: only persisted if the user put them in the file, so
+    # saving a UI toggle doesn't freeze today's defaults forever.
+    _DERIVED_KEYS = frozenset({"preload_ahead", "preload_behind", "cache_max",
+                               "cache_ram_fraction"})
 
     def load(self):
         if self.config_path.exists():
@@ -1115,14 +1050,6 @@ class MainContainer(QWidget):
             self.header_panel.show()
             self.splitter.setSizes([hw, vp_width - hw])
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        state = _config.config["header_state"]
-        if state == 1:
-            hw = int(self.width() * _config.config["header_width_pct"])
-            self.header_panel.setGeometry(0, 0, hw, self.height())
-
-from PySide6.QtCore import Property
 
 class BufferGauges(QWidget):
     def __init__(self, parent=None):
@@ -1609,14 +1536,14 @@ class FitsView(QGraphicsView):
         self._apply_lut(vmin, gamma, vmax)
 
     def auto_stretch(self):
-        """Reset to 1–99 percentile auto-stretch (Cmd+1)."""
+        """Reset to 1–99 percentile auto-stretch (Cmd+4)."""
         if self._stretch_u16 is None:
             return
         self._vmin  = self._auto_vmin
         self._vmax  = self._auto_vmax
         self._gamma = 0.5
         self._apply_lut(self._vmin, self._gamma, self._vmax)
-        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, 0.5)
+        self.stretch_applied.emit(self._raw_flat, self._vmin, self._vmax, 0.5)
 
     def apply_asinh_stretch(self, stretch_factor: float = 5.0):
         """Asinh stretch using current black/white points (Cmd+2)."""
@@ -1625,7 +1552,7 @@ class FitsView(QGraphicsView):
         lut = _compute_asinh_lut(self._stretch_lo, self._stretch_hi,
                                    self._vmin, self._vmax, stretch_factor)
         self._apply_prebuilt_lut(lut)
-        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+        self.stretch_applied.emit(self._raw_flat, self._vmin, self._vmax, self._gamma)
 
     def apply_zscale_stretch(self):
         """ZScale stretch using astropy ZScaleInterval (Cmd+3)."""
@@ -1635,10 +1562,10 @@ class FitsView(QGraphicsView):
                                             self._raw_flat)
         self._vmin, self._vmax, self._gamma = z1, z2, 0.5
         self._apply_prebuilt_lut(lut)
-        self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+        self.stretch_applied.emit(self._raw_flat, self._vmin, self._vmax, self._gamma)
 
     def apply_mtf_stretch(self):
-        """MTF auto-stretch (PixInsight-style) (Cmd+4).
+        """MTF auto-stretch (PixInsight-style) (Cmd+1).
 
         Grayscale: fast LUT path (statistics in u16 space).
         Colour:    per-channel unlinked background neutralisation +
@@ -1656,7 +1583,7 @@ class FitsView(QGraphicsView):
             qi = _rgb_to_qimage(result)
             self._item.setPixmap(QPixmap.fromImage(qi))
         if self._raw_flat is not None:
-            self._histogram.set_data(self._raw_flat, self._vmin, self._vmax, self._gamma)
+            self.stretch_applied.emit(self._raw_flat, self._vmin, self._vmax, self._gamma)
 
     # ------------------------------------------------------------------
     # Zoom
@@ -1808,6 +1735,7 @@ class MainWindow(QMainWindow):
 
         # Stretch data cache (u16 + MTF QImage), LRU order, main-thread only.
         self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
+        self._cache_bytes = 0
 
         # Viewport to restore once the in-flight current image arrives.
         self._pending_saved_viewport = None
@@ -1840,7 +1768,7 @@ class MainWindow(QMainWindow):
 
     def _queue_info(self) -> str:
         return (f"io-queued:{self._io.queued()} inflight:{len(self._inflight)} "
-                f"cached:{len(self._stretch_cache)}")
+                f"cached:{len(self._stretch_cache)} ({self._cache_bytes / 2**30:.1f} GiB)")
 
     # ------------------------------------------------------------------
     # Pipeline (I/O thread → compute pool → main thread)
@@ -1870,9 +1798,11 @@ class MainWindow(QMainWindow):
             return  # executor shut down (app quitting)
 
         def _done(f):
+            if f.cancelled():
+                return  # app shutting down; nothing to report
             try:
                 result = f.result()
-            except BaseException as e:  # includes CancelledError at shutdown
+            except BaseException as e:
                 result = e
             self._pipeline_done.emit(path, result)
         fut.add_done_callback(_done)
@@ -1903,20 +1833,29 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _stretch_cache_put(self, path: str, sd: _StretchData):
+        self._stretch_cache_drop(path)
         self._stretch_cache[path] = sd
-        self._stretch_cache.move_to_end(path)
+        self._cache_bytes += sd.nbytes
         self._evict_cache()
 
+    def _stretch_cache_drop(self, path: str):
+        sd = self._stretch_cache.pop(path, None)
+        if sd is not None:
+            self._cache_bytes -= sd.nbytes
+
     def _evict_cache(self):
-        """Evict least-recently-used entries outside the preload window."""
-        limit = max(_config.config["cache_max"], len(self._window) + 1)
-        while len(self._stretch_cache) > limit:
+        """Evict least-recently-used entries outside the preload window
+        while over the count or RAM budget.  The window itself is never
+        evicted, so it wins over the budget if the two conflict."""
+        max_n = max(_config.config["cache_max"], len(self._window) + 1)
+        max_bytes = _config.ram_bytes * _config.config["cache_ram_fraction"]
+        while len(self._stretch_cache) > max_n or self._cache_bytes > max_bytes:
             victim = next((p for p in self._stretch_cache
                            if p not in self._window and p != self._current_path),
                           None)
             if victim is None:
                 break
-            del self._stretch_cache[victim]
+            self._stretch_cache_drop(victim)
 
     def _stretch_cache_get(self, path: str) -> _StretchData | None:
         sd = self._stretch_cache.get(path)
@@ -2155,7 +2094,7 @@ class MainWindow(QMainWindow):
             # image, FWHM sample (would otherwise skew the session average).
             if self._io.cancel(bad_file):
                 self._inflight.discard(bad_file)
-            self._stretch_cache.pop(bad_file, None)
+            self._stretch_cache_drop(bad_file)
             self._failed.pop(bad_file, None)
             self._fwhm_db.pop(bad_file, None)
             try:
@@ -2214,6 +2153,7 @@ class FitsApp(QApplication):
         self._main_window: MainWindow | None = None
         self._ipc_listener = None
         self._ipc_thread: threading.Thread | None = None
+        self._ipc_closing = False
         self._file_received.connect(self._on_file_received)
 
     def set_main_window(self, window: MainWindow):
@@ -2233,18 +2173,26 @@ class FitsApp(QApplication):
         self._ipc_thread.start()
 
     def _ipc_accept_loop(self) -> None:
-        while True:
+        # Must survive any single bad connection: if this thread dies, the
+        # socket stays bound and every later launch connects to a dead daemon.
+        while not self._ipc_closing:
             try:
-                conn = self._ipc_listener.accept()
-            except OSError:
-                return  # listener was closed (app shutting down)
-            try:
-                path = conn.recv()
-            except EOFError:
+                conn = self._ipc_listener.accept()   # includes auth handshake
+            except Exception:
+                if self._ipc_closing:
+                    return  # listener was closed (app shutting down)
+                _log.warning("ipc: rejected connection", exc_info=True)
+                time.sleep(0.05)  # don't spin if accept keeps failing
                 continue
+            path = None
+            try:
+                if conn.poll(2.0):        # don't let a stalled client block us
+                    path = conn.recv()
+            except Exception:
+                _log.warning("ipc: bad message", exc_info=True)
             finally:
                 conn.close()
-            if path:
+            if isinstance(path, str) and path:
                 self._file_received.emit(path)
 
     def _on_file_received(self, path: str) -> None:
@@ -2256,6 +2204,7 @@ class FitsApp(QApplication):
             self._pending_file = path
 
     def shutdown_ipc(self) -> None:
+        self._ipc_closing = True
         if self._ipc_listener is not None:
             try:
                 self._ipc_listener.close()

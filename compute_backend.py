@@ -24,7 +24,7 @@ if HAS_NUMBA:
     def _apply_mtf_color_numba(u16: np.ndarray, black: np.ndarray, span: np.ndarray, M_luma: float) -> np.ndarray:
         """
         Numba-accelerated color MTF stretch.
-        Processes the array in-place via parallel threads, bypassing massive memory allocations.
+        One parallel pass over the image; no full-size float intermediates.
         """
         H, W, C = u16.shape
         out = np.empty((H, W, 3), dtype=np.uint8)
@@ -50,32 +50,22 @@ if HAS_NUMBA:
                 if b_sub < 0.0: b_sub = 0.0
                 elif b_sub > 1.0: b_sub = 1.0
                 
-                # 3. Compute linear luminance (Rec.709)
-                luma_lin = 0.2126 * r_sub + 0.7152 * g_sub + 0.0722 * b_sub
-                
-                # 4. Apply PixInsight MTF rational function to luminance
-                if luma_lin == 0.0:
-                    luma_str = 0.0
-                else:
-                    denom = (2.0 * M_luma - 1.0) * luma_lin - M_luma
-                    if abs(denom) < 1e-12:
-                        denom = 1.0
-                    luma_str = (M_luma - 1.0) * luma_lin / denom
-                    if luma_str < 0.0: luma_str = 0.0
-                    elif luma_str > 1.0: luma_str = 1.0
-                    
+                # 3. Linear luminance (Rec.709)
                 luma = 0.2126 * r_sub + 0.7152 * g_sub + 0.0722 * b_sub
-                
                 if luma <= 0.0:
                     out[i, j, 0] = 0
                     out[i, j, 1] = 0
                     out[i, j, 2] = 0
                     continue
-                    
-                # 4. Apply rational MTF to luminance
-                x = luma
-                x_mtf = ((M_luma - 1.0) * x) / ((2.0 * M_luma - 1.0) * x - M_luma)
-                
+
+                # 4. PixInsight rational MTF on luminance.  For M in (0, 1)
+                #    and luma in (0, 1] the denominator is always < 0, but
+                #    guard it like the NumPy path does.
+                denom = (2.0 * M_luma - 1.0) * luma - M_luma
+                if abs(denom) < 1e-12:
+                    denom = 1.0
+                x_mtf = ((M_luma - 1.0) * luma) / denom
+
                 # 5. Chrominance preservation (scale RGB by MTF/Luma ratio)
                 ratio = x_mtf / luma
                 

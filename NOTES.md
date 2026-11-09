@@ -1,89 +1,42 @@
-# Performance Plan
+# Performance notes
 
-## Time budget per file (steady state, 2 preload workers)
+## Where the time goes (2026-11, 8288×5644 mono 16-bit, 93 MB, SMB NAS)
 
-| Stage                          | Time     | % of total |
-|-------------------------------|----------|------------|
-| I/O (`_load_path_raw_data`)   | ~100 ms  | 4%         |
-| Debayer                       | ~540 ms  | 22%        |
-| Quantize (clip + astype + flipud) | ~660 ms | 27%    |
-| MTF render (`_apply_mtf_color`) | ~1,100 ms | 45%    |
-| **Total**                     | **~2,400 ms** |       |
+| Stage                                   | Time       | Where          |
+|-----------------------------------------|------------|----------------|
+| Read (`_load_path_raw_data`)            | ~2.2–2.8 s | `fits-io` thread |
+| Quantize + FWHM + MTF (`_compute_from_raw`) | ~0.27 s | compute pool (4) |
+| Show cached image (`FitsView` + histogram) | ~30 ms  | main thread    |
 
-First cold load spikes to ~7 s because all three workers start simultaneously,
-thrashing the memory bus and numpy thread pool.
+The network link (~35 MB/s here) is the bottleneck by an order of
+magnitude, so the pipeline is organised around **read order**, not compute:
 
-## Root cause
+- One I/O thread (`_IoScheduler`) does all reads: current image first,
+  then preloads nearest-first (priority 2·distance, travel direction
+  winning ties). Queued reads are re-prioritised on every navigation and
+  removed when they leave the window.
+- Each path has at most one load in flight (`MainWindow._inflight`); the
+  current image and preloads share it.
+- Every finished load is cached; it is displayed only if still current.
+- Preload window: 12 ahead / 10 behind (configurable). Cache limit: 100
+  images or 10 % of RAM, measured from real per-image size; the window is
+  never evicted.
+- `fits.open(memmap=False)`: one bulk read is faster than mmap page faults
+  over SMB and keeps network I/O on the I/O thread.
 
-All stages operate on a ~242 MB float32 array (3672×5496×3). The pipeline
-makes ~5 full passes over that data. Cores stall on memory bandwidth, not
-instruction throughput — which is why peak aggregate CPU was only ~50% even
-with work queued. Adding workers past a threshold makes this worse.
+## Remaining levers
 
-## I/O architecture (do this first)
+- **Network**: 93 MB at gigabit wire speed is ~0.85 s vs ~2.5 s observed.
+  Wired link / SMB settings matter more than any code change.
+- Compute is already small; the Numba colour MTF kernel and OpenCV
+  debayer are single passes. Not worth optimising further until the read
+  is much faster.
 
-**Funnel all file reads through a single dedicated I/O worker.**
+## Pitfalls seen
 
-Right now the preload pool (N workers) and the stretch executor each call
-`_load_path_raw_data` independently, meaning multiple threads can be
-seeking/reading different FITS files concurrently. Even on NVMe this is
-counter-productive: the OS prefetcher works best with sequential reads, and
-competing threads cause seek amplification and cache thrashing.
-
-Proposed model:
-- One `_io_executor` (1 worker, thread name `fits-io`) owns all disk reads.
-- After a read completes, the raw `(data, header)` is handed off to a
-  `_compute_executor` (N workers) that runs debayer + quantize + MTF.
-- The stretch executor for the current file becomes a priority lane in the
-  same compute pool (submit first, or use a separate 1-worker queue).
-
-This serializes I/O, maximizes read throughput per file, and lets the compute
-workers stay busy without competing for disk bandwidth.
-
-## Tier 1 — drop-in, low risk
-
-1. **Single I/O worker** (see above) — serializes reads, lets OS prefetch
-   efficiently, eliminates disk contention between preload threads.
-
-2. **Switch debayer to OpenCV** — `cv2.cvtColor(raw, cv2.COLOR_BAYER_RG2RGB)`
-   runs in C++. Drops debayer from ~540 ms to ~30–50 ms. One import, two lines
-   changed, ~480 ms saved per file, no algorithmic change. Need to map our
-   RGGB/BGGR/GRBG/GBRG patterns to OpenCV's `BAYER_*` constants.
-
-3. **Use subsampled data for percentile stats in `_build_stretch_data`** —
-   `np.nanpercentile` is called on the full 20 MP array to find `lo`/`hi`.
-   We already have `_subsample` (500 K pixels); just apply it here. Saves
-   most of the "quantize" time since the clip/astype/flipud itself is fast.
-
-4. **Increase compute worker count to 4–5** — with debayer and stats sped up,
-   memory bandwidth per worker drops and more parallelism helps. With 4
-   workers at ~1 s each (post-OpenCV), throughput is ~4 files/sec — enough
-   that a 3-ahead preload never misses under normal browsing.
-
-## Tier 2 — medium effort, large payoff
-
-5. **MTF render on GPU via Apple MLX** — `_apply_mtf_color` makes ~8 passes
-   over the 242 MB array (per-channel stats ×3, bg_sub, luma, safe_luma,
-   ratio, result). MLX has a near-identical API to NumPy; the rational
-   function, elementwise ops, and weighted sums are all natively supported.
-   Estimated drop: 1,100 ms → ~50–80 ms. ~20-line change.
-
-## Tier 3 — maximum performance, higher complexity
-
-6. **Full pipeline on GPU in one pass** — combine debayer + quantize + MTF
-   into a single MLX (or Metal) computation graph. Raw 16-bit pixels go in,
-   8-bit RGB comes out, with zero intermediate host copies. Eliminates
-   essentially all memory-bandwidth overhead. Rough estimate: ~200 ms total
-   per file (dominated by I/O), vs ~2,400 ms today.
-
-## Expected outcomes
-
-| Config                              | Time/file | Throughput   |
-|------------------------------------|-----------|--------------|
-| Current (2 workers, NumPy)         | ~2,400 ms | ~0.8 files/s |
-| +single I/O + OpenCV debayer       | ~1,800 ms | ~1.1 files/s |
-| +subsampled stats + 4 workers      | ~1,100 ms | ~3.6 files/s |
-| +MLX MTF                           | ~200 ms   | >>10 files/s |
-
-At ~200 ms/file a 3-ahead preload means the cache is always warm unless the
-user navigates faster than ~5 files/second.
+- macOS sends the launch file twice (argv + `QFileOpenEvent`); `_load_fits`
+  must be idempotent. Offscreen Qt runs don't reproduce this.
+- FWHM: star candidates include galaxy knots / HII regions on extended
+  targets (M33 centre reads ~7.8 px vs ~4.2 px in the corners), so the
+  gauge is best for comparing frames of the same target, not as an
+  absolute seeing number.

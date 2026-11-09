@@ -8,9 +8,12 @@ running daemon must be near-free.
 Uses multiprocessing.connection, which transparently maps to a Unix domain
 socket on macOS/Linux and a named pipe on Windows.
 """
+import errno
 import os
+import socket
 import sys
 import tempfile
+import threading
 from multiprocessing.connection import Client, Listener
 
 
@@ -61,31 +64,76 @@ def _authkey() -> bytes:
 ADDRESS = _address()
 
 
-def connect_to_daemon(file_path: str | None, timeout: float = 0.5) -> bool:
+def connect_to_daemon(file_path: str | None, timeout: float = 2.0) -> bool:
     """Hand a file path off to an already-running daemon, if one exists.
 
     Returns True if a daemon accepted the handoff (caller should exit
     immediately without building a window), False if no daemon is running
-    (caller should become the daemon / show its own window).
+    or it doesn't answer within ``timeout`` (caller should run its own
+    window).  The timeout matters: a wedged daemon must never turn a
+    double-click into a launcher that hangs forever.
     """
+    # multiprocessing's Client has no timeout, and a socket-level timeout
+    # would make its raw-fd reads non-blocking (spurious failures against a
+    # healthy daemon).  Run the whole handshake in a worker thread instead;
+    # if it doesn't finish in time, give up and leave the thread blocked
+    # (daemon thread: it dies with the process).
+    result = [False]
+
+    def _handoff():
+        try:
+            conn = Client(ADDRESS, authkey=_authkey())
+            try:
+                conn.send(file_path)
+            finally:
+                conn.close()
+            result[0] = True
+        except Exception:  # not running, refused, auth mismatch...
+            pass
+
+    t = threading.Thread(target=_handoff, name="fits-ipc-client", daemon=True)
+    t.start()
+    t.join(timeout)
+    return result[0] and not t.is_alive()
+
+
+def _socket_is_stale() -> bool:
+    """True if the socket file exists but nothing is listening on it
+    (the previous daemon crashed or was killed without cleaning up)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.5)
     try:
-        conn = Client(ADDRESS, authkey=_authkey())
-    except (FileNotFoundError, ConnectionRefusedError, OSError):
+        s.connect(ADDRESS)
         return False
-    try:
-        conn.send(file_path)
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
     finally:
-        conn.close()
-    return True
+        s.close()
 
 
 def start_listener() -> Listener | None:
     """Try to become the daemon by binding the well-known address.
 
-    Returns a Listener on success, or None if another process already holds
-    it (or the bind otherwise fails) -- callers should fall back to running
-    as a normal, non-resident single window in that case.
+    Returns a Listener on success, or None if another live process already
+    holds it (or the bind otherwise fails) -- callers should fall back to
+    running as a normal, non-resident single window in that case.  A socket
+    file left behind by a crashed daemon is removed and the bind retried;
+    otherwise no later launch could ever become the daemon again.
     """
+    try:
+        return Listener(ADDRESS, authkey=_authkey())
+    except OSError as e:
+        if (sys.platform == "win32" or e.errno != errno.EADDRINUSE
+                or not _socket_is_stale()):
+            return None
+    try:
+        os.unlink(ADDRESS)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
     try:
         return Listener(ADDRESS, authkey=_authkey())
     except OSError:
