@@ -11,10 +11,10 @@ echo "Installing $APP_NAME to ~/Applications..."
 
 # Generate the AppleScript wrapper using osacompile
 osacompile -o "$APP_DIR" -e 'on open theFiles' \
-    -e "do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:\$PATH; cd '$REPO_DIR' && uv run python3 main.py \\\"\" & POSIX path of item 1 of theFiles & \"\\\" >/dev/null 2>&1 &\"" \
+    -e "do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:\$PATH; cd '$REPO_DIR' && uv run python3 launcher.py \\\"\" & POSIX path of item 1 of theFiles & \"\\\" >/dev/null 2>&1 &\"" \
     -e 'end open' \
     -e 'on run' \
-    -e "do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:\$PATH; cd '$REPO_DIR' && uv run python3 main.py >/dev/null 2>&1 &\"" \
+    -e "do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:\$PATH; cd '$REPO_DIR' && uv run python3 launcher.py >/dev/null 2>&1 &\"" \
     -e 'end run'
 
 PLIST="$APP_DIR/Contents/Info.plist"

@@ -1,19 +1,21 @@
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 import argparse
 import shutil
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
+
+import ipc
 
 _log = logging.getLogger(__name__)
 from astropy.io import fits
 from astropy.visualization import ZScaleInterval
-from scipy.stats import median_abs_deviation
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QLabel, QGraphicsView,
     QGraphicsScene, QGraphicsPixmapItem, QSizePolicy, QWidget,
@@ -155,23 +157,26 @@ def fits_data_to_pixmap(data, header=None, vmin=None, vmax=None, gamma=0.5):
 
 
 def _load_path_raw_data(path: str) -> tuple[np.ndarray, object] | tuple[None, None]:
-    """Load raw array + header for histogram/stretch use. Main-thread only."""
-    t0   = time.perf_counter()
-    name = os.path.basename(path)
-    try:
-        with fits.open(path) as hdul:
-            hdu = next((h for h in hdul if h.data is not None
-                        and h.data.ndim >= 2), None)
-            if hdu is None:
-                return None, None
-            # Do NOT use .copy(); returning a view allows astropy to use mmap
-            data, header = hdu.data, hdu.header
-        _log.debug("_load_path_raw_data: %.1f ms  %s",
-                   (time.perf_counter() - t0) * 1000, name)
-        return data, header
-    except Exception:
-        _log.exception("_load_path_raw_data failed: %s", name)
-        return None, None
+    """Load raw array + header from disk.  Runs on the I/O thread.
+
+    Returns (None, None) if the file has no image HDU; raises on read errors
+    so callers can report *why* a file failed.
+
+    memmap=False: on network shares (SMB) one bulk read is noticeably faster
+    than page-faulting through an mmap (~2.2 s vs ~2.7 s for a 93 MB frame),
+    and it guarantees all network I/O happens here, on the I/O thread, rather
+    than lazily inside a compute worker.
+    """
+    t0 = time.perf_counter()
+    with fits.open(path, memmap=False) as hdul:
+        hdu = next((h for h in hdul if h.data is not None
+                    and h.data.ndim >= 2), None)
+        if hdu is None:
+            return None, None
+        data, header = hdu.data, hdu.header
+    _log.debug("_load_path_raw_data: %.1f ms  %s",
+               (time.perf_counter() - t0) * 1000, os.path.basename(path))
+    return data, header
 
 
 def _extract_wb_multipliers(header) -> tuple[float, float, float] | None:
@@ -336,6 +341,13 @@ def _mtf_rational(t: np.ndarray, M: float) -> np.ndarray:
     return np.where(t == 0.0, 0.0, np.clip(result, 0.0, 1.0))
 
 
+def _median_abs_deviation(a: np.ndarray) -> float:
+    """Median absolute deviation, scaled so it estimates the std-dev of a
+    normal distribution (matches scipy.stats.median_abs_deviation(scale="normal")).
+    """
+    return 1.4826022185056018 * float(np.median(np.abs(a - np.median(a))))
+
+
 def _mtf_stats(samples: np.ndarray,
                shadow_clip: float = -2.8) -> tuple[float, float, float]:
     """Compute MTF black point, normalization span, and midtone-balance M.
@@ -359,7 +371,7 @@ def _mtf_stats(samples: np.ndarray,
     if nonzero.size < 100:                          # fall back if almost nothing
         nonzero = sub
     med   = float(np.median(nonzero))
-    mad   = float(median_abs_deviation(nonzero, scale="normal"))
+    mad   = _median_abs_deviation(nonzero)
     black = med + shadow_clip * mad                 # shadow_clip < 0 → below median
     span  = float(nonzero.max()) - black
     if span <= 0:
@@ -457,6 +469,76 @@ def _subsample(arr: np.ndarray, n: int = _SUBSAMPLE_N) -> np.ndarray:
     if flat.size <= n:
         return flat
     return _GLOBAL_RNG.choice(flat, size=n, replace=False)
+
+
+# ---------------------------------------------------------------------------
+# Prioritised I/O scheduler
+# ---------------------------------------------------------------------------
+
+class _IoScheduler:
+    """One I/O thread reading files in priority order (lowest number first).
+
+    Unlike a FIFO ThreadPoolExecutor, queued reads can be re-prioritised (so
+    the file the user just navigated to jumps the queue) and truly cancelled
+    (so abandoned preloads never touch the network).  A read that has already
+    started cannot be interrupted; its result is still delivered.
+
+    on_loaded(path, data, header, exc) is called on the I/O thread.
+    """
+
+    def __init__(self, on_loaded):
+        self._on_loaded = on_loaded
+        self._cv = threading.Condition()
+        self._queue: dict[str, float] = {}     # path → priority
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="fits-io",
+                                        daemon=True)
+        self._thread.start()
+
+    def submit(self, path: str, priority: float):
+        with self._cv:
+            self._queue[path] = priority
+            self._cv.notify()
+
+    def reprioritize(self, path: str, priority: float):
+        """Change the priority of a *queued* read; no-op if not queued."""
+        with self._cv:
+            if path in self._queue:
+                self._queue[path] = priority
+
+    def cancel(self, path: str) -> bool:
+        """Drop a queued read.  Returns False if it isn't queued (running/done)."""
+        with self._cv:
+            return self._queue.pop(path, None) is not None
+
+    def queued(self) -> int:
+        with self._cv:
+            return len(self._queue)
+
+    def stop(self):
+        with self._cv:
+            self._stopped = True
+            self._queue.clear()
+            self._cv.notify_all()
+
+    def _run(self):
+        while True:
+            with self._cv:
+                while not self._queue and not self._stopped:
+                    self._cv.wait()
+                if self._stopped:
+                    return
+                path = min(self._queue, key=self._queue.__getitem__)
+                del self._queue[path]
+            data = header = exc = None
+            try:
+                data, header = _load_path_raw_data(path)
+            except Exception as e:  # reported to the UI, not just logged
+                exc = e
+            try:
+                self._on_loaded(path, data, header, exc)
+            except Exception:
+                _log.exception("[io] on_loaded callback failed: %s", path)
 
 # ---------------------------------------------------------------------------
 # Directory navigation helpers
@@ -709,7 +791,11 @@ def _compute_from_raw(path: str, raw_data: np.ndarray,
                (t_mtf - t0) * 1000,
                (time.perf_counter() - t_mtf) * 1000,
                (time.perf_counter() - t0) * 1000, name)
-    return _StretchData(u16, lo, hi, raw_flat, mtf_qi, mtf_rgb, dict(raw_header), fwhm=fwhm)
+    # In GUI mode the QImage holds the rendered pixels; don't also keep the
+    # uint8 array alive in the cache (it's only used by headless mode).
+    return _StretchData(u16, lo, hi, raw_flat, mtf_qi,
+                        mtf_rgb if headless else None,
+                        dict(raw_header), fwhm=fwhm)
 
 import json
 from pathlib import Path
@@ -750,18 +836,31 @@ class ConfigManager:
         
         allowed = int((ram_bytes * 0.10) / (121 * 1024**2))
         allowed = max(5, allowed)
-        
+
+        # Preloads are read nearest-first, so a deep window costs nothing in
+        # responsiveness; it just keeps the link busy.  Back-and-forth review
+        # is common, so the window is (nearly) symmetric and ≥10 each way.
+        ahead, behind = 12, 10
+
         self.config = {
             "header_state": 0, # 0=Hidden, 1=Transparent, 2=Opaque
             "header_width_pct": 0.15,
             "show_all_headers": False,
             "checked_headers": [],
-            "preload_ahead": int(allowed * 0.6),
-            "preload_behind": int(allowed * 0.15),
-            "cache_max": allowed - int(allowed * 0.6) - int(allowed * 0.15),
+            "preload_ahead": ahead,
+            "preload_behind": behind,
+            # Total stretched images held in RAM.  Never smaller than the
+            # preload window (enforced again in MainWindow); the extra slots
+            # keep recently-viewed images that fell out of the window.
+            "cache_max": max(allowed, ahead + behind + 1),
             "histogram_visible": True
         }
+        self._file_keys: set[str] = set()
         self.load()
+
+    # RAM-derived defaults: only persisted if the user put them in the file,
+    # so saving a UI toggle doesn't freeze today's defaults forever.
+    _DERIVED_KEYS = frozenset({"preload_ahead", "preload_behind", "cache_max"})
 
     def load(self):
         if self.config_path.exists():
@@ -769,14 +868,17 @@ class ConfigManager:
                 with open(self.config_path, "r") as f:
                     data = json.load(f)
                     self.config.update(data)
+                    self._file_keys = set(data)
             except Exception as e:
                 _log.error("Failed to load config: %s", e)
 
     def save(self):
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            out = {k: v for k, v in self.config.items()
+                   if k not in self._DERIVED_KEYS or k in self._file_keys}
             with open(self.config_path, "w") as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(out, f, indent=2)
         except Exception as e:
             _log.error("Failed to save config: %s", e)
 
@@ -1164,20 +1266,34 @@ class FwhmGaugeOverlay(QWidget):
             p.drawRect(2, y - 1, rect.width() - 4, 4)
 
 class LoadingWidget(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, name: str = "", parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         label = QLabel("u know i'm loading dem imgs bro 🙃")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         prog = QProgressBar()
         prog.setRange(0, 0)
         prog.setFixedWidth(200)
-        
+
         layout.addWidget(label)
-        layout.addWidget(prog)
+        if name:
+            name_label = QLabel(name)
+            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_label.setStyleSheet("color: #888;")
+            layout.addWidget(name_label)
+        layout.addWidget(prog, alignment=Qt.AlignmentFlag.AlignCenter)
+
+
+class LoadErrorWidget(QLabel):
+    """Shown in place of an image that could not be read/processed."""
+    def __init__(self, name: str, reason: str, parent=None):
+        super().__init__(f"couldn't load this one bro 😵\n\n{name}\n\n{reason}"
+                         "\n\n(← / → still work)", parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
 
 # ---------------------------------------------------------------------------
 # Qt widgets
@@ -1364,13 +1480,13 @@ class FitsView(QGraphicsView):
                 def restore_scroll():
                     self.horizontalScrollBar().setValue(h_val)
                     self.verticalScrollBar().setValue(v_val)
-                QTimer.singleShot(0, restore_scroll)
+                QTimer.singleShot(0, self, restore_scroll)  # self as context: dropped if the view is deleted first
                 
             elif len(self._saved_viewport) == 3:
                 t, c, psize = self._saved_viewport
                 self._saved_viewport = None
                 self.setTransform(t)
-                QTimer.singleShot(0, lambda: self.centerOn(c))
+                QTimer.singleShot(0, self, lambda: self.centerOn(c))
                 
             self._is_fitted = False
 
@@ -1389,7 +1505,7 @@ class FitsView(QGraphicsView):
         if self._saved_viewport is None and not self._initial_fit_done:
             self._initial_fit_done = True
             self._fit_pending = True
-            QTimer.singleShot(0, self._fit)
+            QTimer.singleShot(0, self, self._fit)
         self._position_overlays()
 
     def resizeEvent(self, event):
@@ -1641,9 +1757,12 @@ class FitsView(QGraphicsView):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    # Emitted from worker thread; queued connection ensures delivery on main thread.
-    _stretch_ready = Signal(int, str, object)
-    _buffer_gauge_trigger = Signal()
+    # Emitted from I/O / compute threads with (path, _StretchData | Exception |
+    # None); the queued connection delivers it on the main thread.
+    _pipeline_done = Signal(str, object)
+
+    # Priority for the image the user is looking at (preloads use 2·distance).
+    _PRIO_CURRENT = -1
 
     def __init__(self, fits_path: str | None = None):
         super().__init__()
@@ -1654,24 +1773,28 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.main_container)
         
         self._fits_files: list[str] = []
+        self._fits_dir: str | None = None
         self._bad_files: set[str] = set()
         self._fwhm_db: dict[str, float] = {}
         self._current_path: str = ""
+        self._displayed_path: str | None = None   # path the FitsView shows
         self._current_index: int    = 0
         self._nav_direction: int    = 1
         self._current_ahead: int    = 0
         self._current_behind: int   = 0
-        self._stretch_generation: int = 0   # incremented on each navigate; stale
-                                            # async results are discarded
 
-        # Two-stage pipeline: one I/O worker serialises all disk reads;
-        # multiple compute workers handle debayer + quantize + MTF in parallel.
-        # _preload_futures stores pipeline Future objects (see _start_pipeline).
-        self._preload_futures: dict[str, Future] = {}
-        self._io_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="fits-io")
+        # Pipeline: one prioritised I/O thread (all network reads, nearest
+        # first) → compute pool (debayer + quantize + MTF).  Every path has
+        # at most one pipeline in flight; the current file and preloads share
+        # it, so navigating onto a file that is already loading just waits for
+        # that load instead of starting a second one at the back of the queue.
+        self._inflight: set[str] = set()           # submitted, not yet reported
+        self._failed: dict[str, str] = {}          # path → error message
+        self._window: set[str] = set()             # paths in the preload window
         self._compute_executor = ThreadPoolExecutor(
             max_workers=_COMPUTE_WORKERS, thread_name_prefix="fits-compute")
+        self._io = _IoScheduler(self._on_io_loaded)
+        self._pipeline_done.connect(self._on_pipeline_done)
 
         # Dispatch a tiny warmup matrix to force Numba JIT compilation/deserialization 
         # in the background before the first real megapixel image arrives.
@@ -1683,13 +1806,10 @@ class MainWindow(QMainWindow):
             0.5
         )
 
-        # Stretch data cache (u16 + MTF QImage) for both current and preloaded files.
+        # Stretch data cache (u16 + MTF QImage), LRU order, main-thread only.
         self._stretch_cache: OrderedDict[str, _StretchData] = OrderedDict()
-        self._stretch_pending: int = 0   # in-flight current-file pipelines (approx)
-        self._stretch_ready.connect(self._deliver_stretch)
-        self._buffer_gauge_trigger.connect(self._update_buffer_gauges)
 
-        # Saved viewport for the in-flight stretch miss; consumed by _deliver_stretch.
+        # Viewport to restore once the in-flight current image arrives.
         self._pending_saved_viewport = None
 
         # Window-level shortcuts (fire even when FitsView has focus)
@@ -1719,65 +1839,64 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _queue_info(self) -> str:
-        return f"preload:{len(self._preload_futures)} stretch:{self._stretch_pending}"
+        return (f"io-queued:{self._io.queued()} inflight:{len(self._inflight)} "
+                f"cached:{len(self._stretch_cache)}")
 
     # ------------------------------------------------------------------
-    # Two-stage I/O → compute pipeline
+    # Pipeline (I/O thread → compute pool → main thread)
     # ------------------------------------------------------------------
 
-    def _start_pipeline(self, path: str) -> Future:
-        """Submit path through the single I/O worker then the compute pool.
+    def _request(self, path: str, priority: float):
+        """Ensure path is loading (or loaded) at the given priority."""
+        if path in self._stretch_cache:
+            return
+        if path in self._inflight:
+            self._io.reprioritize(path, priority)
+            return
+        self._inflight.add(path)
+        self._io.submit(path, priority)
 
-        Returns a Future that resolves to _StretchData | None once both
-        stages complete.  Call .cancel() to abandon; in-progress I/O cannot
-        be interrupted but the compute stage will not start if the future
-        is already cancelled when I/O finishes.
-        """
-        result_future: Future = Future()
+    def _on_io_loaded(self, path, raw_data, raw_header, exc):
+        """I/O thread: hand the raw data to the compute pool."""
+        if exc is not None or raw_data is None:
+            self._pipeline_done.emit(
+                path, exc if exc is not None else ValueError("no image data in file"))
+            return
+        _log.debug("[io] done → compute  %s", os.path.basename(path))
+        try:
+            fut = self._compute_executor.submit(
+                _compute_from_raw, path, raw_data, raw_header)
+        except RuntimeError:
+            return  # executor shut down (app quitting)
+
+        def _done(f):
+            try:
+                result = f.result()
+            except BaseException as e:  # includes CancelledError at shutdown
+                result = e
+            self._pipeline_done.emit(path, result)
+        fut.add_done_callback(_done)
+
+    def _on_pipeline_done(self, path: str, result):
+        """Main thread: every finished load lands here, wanted or not."""
+        self._inflight.discard(path)
         name = os.path.basename(path)
-
-        def _on_io_done(io_future):
-            if result_future.cancelled():
-                return
-            try:
-                raw_data, raw_header = io_future.result()
-            except Exception as exc:
-                _log.exception("[io] failed: %s", name)
-                try:
-                    result_future.set_exception(exc)
-                except Exception:
-                    pass
-                return
-            if raw_data is None:
-                try:
-                    result_future.set_result(None)
-                except Exception:
-                    pass
-                return
-            _log.debug("[io] done → compute  %s", name)
-            try:
-                compute_future = self._compute_executor.submit(
-                    _compute_from_raw, path, raw_data, raw_header)
-            except RuntimeError:
-                # Executor already shut down (app quitting); discard quietly.
-                return
-            compute_future.add_done_callback(_on_compute_done)
-
-        def _on_compute_done(compute_future):
-            if result_future.cancelled():
-                return
-            try:
-                result_future.set_result(compute_future.result())
-            except Exception as exc:
-                try:
-                    result_future.set_exception(exc)
-                except Exception:
-                    pass
-
-        _log.debug("[io] queued  [%s]  %s", self._queue_info(), name)
-        io_future = self._io_executor.submit(_load_path_raw_data, path)
-        io_future.add_done_callback(_on_io_done)
-        return result_future
+        if isinstance(result, _StretchData):
+            self._failed.pop(path, None)
+            self._stretch_cache_put(path, result)
+            if path == self._current_path and self._displayed_path != path:
+                saved_vp = self._pending_saved_viewport
+                self._pending_saved_viewport = None
+                self._show_stretch(path, result, saved_vp)
+        else:
+            reason = (f"{type(result).__name__}: {result}"
+                      if isinstance(result, BaseException) else "no image data")
+            self._failed[path] = reason
+            _log.error("load failed: %s  (%s)", name, reason)
+            if path == self._current_path:
+                self._displayed_path = None
+                self.main_container.set_view(LoadErrorWidget(name, reason))
+        self._update_buffer_gauges()
 
     # ------------------------------------------------------------------
     # Stretch data cache helpers (main-thread only)
@@ -1786,51 +1905,62 @@ class MainWindow(QMainWindow):
     def _stretch_cache_put(self, path: str, sd: _StretchData):
         self._stretch_cache[path] = sd
         self._stretch_cache.move_to_end(path)
-        while len(self._stretch_cache) > _config.config["cache_max"]:
-            self._stretch_cache.popitem(last=False)
+        self._evict_cache()
+
+    def _evict_cache(self):
+        """Evict least-recently-used entries outside the preload window."""
+        limit = max(_config.config["cache_max"], len(self._window) + 1)
+        while len(self._stretch_cache) > limit:
+            victim = next((p for p in self._stretch_cache
+                           if p not in self._window and p != self._current_path),
+                          None)
+            if victim is None:
+                break
+            del self._stretch_cache[victim]
 
     def _stretch_cache_get(self, path: str) -> _StretchData | None:
-        # Harvest any completed preload futures first.
-        future = self._preload_futures.get(path)
-        if future is not None and future.done():
-            self._preload_futures.pop(path)
-            try:
-                r = future.result()
-                if r is not None:
-                    self._stretch_cache_put(path, r)
-            except Exception:
-                pass
-        if path in self._stretch_cache:
+        sd = self._stretch_cache.get(path)
+        if sd is not None:
             self._stretch_cache.move_to_end(path)
-            return self._stretch_cache[path]
-        return None
+        return sd
 
     # ------------------------------------------------------------------
     # Preloading
     # ------------------------------------------------------------------
 
     def _trigger_preload(self, ahead: int, behind: int):
+        """Queue the window around the current image, nearest first.
+
+        Priority 2·d for the travel direction, 2·d+1 for the other, so the
+        two neighbours at the same distance interleave.  Navigation does not
+        wrap at the ends of the list, so neither does the window.
+        """
         self._current_ahead = ahead
         self._current_behind = behind
         if not self._fits_files:
             return
-        n = len(self._fits_files)
-        d = self._nav_direction
-        wanted: set[str] = set()
-        for i in range(1, ahead + 1):
-            wanted.add(self._fits_files[(self._current_index + d * i) % n])
-        for i in range(1, behind + 1):
-            wanted.add(self._fits_files[(self._current_index - d * i) % n])
-        for path in list(self._preload_futures):
-            if path not in wanted:
-                self._preload_futures.pop(path).cancel()
-        for path in wanted:
-            if path not in self._stretch_cache and path not in self._preload_futures:
-                future = self._start_pipeline(path)
-                future.add_done_callback(lambda f: self._buffer_gauge_trigger.emit())
-                self._preload_futures[path] = future
+        n, idx, d = len(self._fits_files), self._current_index, self._nav_direction
+        order: list[tuple[int, str]] = []
+        for i in range(1, max(ahead, behind) + 1):
+            j = idx + d * i
+            if i <= ahead and 0 <= j < n:
+                order.append((2 * i, self._fits_files[j]))
+            j = idx - d * i
+            if i <= behind and 0 <= j < n:
+                order.append((2 * i + 1, self._fits_files[j]))
+        self._window = {p for _, p in order}
 
+        # Drop queued reads that fell out of the window (running ones finish
+        # and are cached anyway).
+        for p in list(self._inflight):
+            if p != self._current_path and p not in self._window:
+                if self._io.cancel(p):
+                    self._inflight.discard(p)
 
+        for prio, p in order:
+            if p not in self._failed:
+                self._request(p, prio)
+        self._evict_cache()
 
     # ------------------------------------------------------------------
     # Loading
@@ -1841,75 +1971,66 @@ class MainWindow(QMainWindow):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.main_container.set_view(label)
 
-    def _load_fits(self, path: str, saved_viewport=None):
+    def _show_stretch(self, path: str, sd: _StretchData, saved_viewport=None):
+        """Display a ready image (main thread)."""
+        vp_to_restore = None
+        if saved_viewport is not None:
+            if saved_viewport[-1] == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
+                vp_to_restore = saved_viewport
+            else:
+                _log.debug("_show_stretch: size mismatch, discarding saved_viewport")
+        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore,
+                        is_bad=path in self._bad_files)
+        self.main_container.set_view(view, sd.raw_header)
+        self._displayed_path = path
+        if sd.fwhm > 0.0:
+            self._fwhm_db[path] = sd.fwhm
+        self.main_container.update_fwhm_db(self._fwhm_db, self._bad_files, self._current_path)
+
+    def _load_fits(self, path: str, saved_viewport=None, reindex: bool = True):
         t0       = time.perf_counter()
         abs_path = os.path.abspath(path)
         name     = os.path.basename(abs_path)
-        self.setWindowTitle(f"FITS Preview — {name}")
-        self._current_path = abs_path
-        self._stretch_generation += 1
-        gen = self._stretch_generation
         try:
-            # ── Step 1: Check stretch cache (includes harvesting preloads) ─
-            stretch = self._stretch_cache_get(abs_path)
-            _log.info("_load_fits: stretch %s  [%s]  %s",
-                       "HIT" if stretch else "MISS (async)", self._queue_info(), name)
+            # macOS delivers the launch file twice (argv + QFileOpenEvent);
+            # the IPC handoff can repeat it too.  Don't restart anything.
+            already = (abs_path == self._current_path and
+                       (self._displayed_path == abs_path or abs_path in self._inflight))
 
-            if stretch is not None:
-                # ── HIT: build FitsView with pre-rendered MTF image ───────
-                pixmap = QPixmap.fromImage(stretch.mtf_qimage)
-                vp_to_restore = None
-                if saved_viewport is not None:
-                    old_size = saved_viewport[-1]
-                    if old_size == (pixmap.width(), pixmap.height()):
-                        vp_to_restore = saved_viewport
-                        _log.debug("_load_fits (HIT): matched old size %s, propagating vp_to_restore", old_size)
-                    else:
-                        _log.debug("_load_fits (HIT): size mismatch, discarding saved_viewport")
-                is_bad = abs_path in self._bad_files
-                view = FitsView(stretch.mtf_qimage, stretch,
-                                saved_viewport=vp_to_restore, is_bad=is_bad)
-                self.main_container.set_view(view, stretch.raw_header)
-                if stretch.fwhm > 0.0:
-                    self._fwhm_db[abs_path] = stretch.fwhm
-                if self.main_container is not None:
-                    self.main_container.update_fwhm_db(self._fwhm_db, self._bad_files, self._current_path)
-                    
-                _log.debug("_load_fits: displayed in %.1f ms  [%s]  %s",
-                           (time.perf_counter() - t0) * 1000, self._queue_info(), name)
-            else:
-                # ── MISS: keep current view visible; submit stretch worker ─
-                # Store the saved viewport so _deliver_stretch can restore it.
-                self._pending_saved_viewport = saved_viewport
-                if not isinstance(self.main_container.get_view(), FitsView):
-                    self.main_container.set_view(LoadingWidget())
+            self.setWindowTitle(f"FITS Preview — {name}")
+            self._current_path = abs_path
 
-                def _on_pipeline_done(future):
-                    self._stretch_pending -= 1
-                    try:
-                        sd = future.result()
-                    except Exception:
-                        _log.exception("pipeline failed: %s", name)
-                        return
-                    if sd is not None:
-                        self._stretch_ready.emit(gen, abs_path, sd)
-
-                self._stretch_pending += 1
-                self._start_pipeline(abs_path).add_done_callback(_on_pipeline_done)
-
-            # ── Step 2: Directory index + preload ─────────────────────────
-            self._fits_files = _fits_siblings(abs_path)
+            # ── Directory index (only re-listed when needed: SMB listdir) ──
+            directory = os.path.dirname(abs_path)
+            if reindex or directory != self._fits_dir or abs_path not in self._fits_files:
+                self._fits_files = _fits_siblings(abs_path)
+                self._fits_dir = directory
             try:
                 self._current_index = self._fits_files.index(abs_path)
             except ValueError:
                 self._current_index = 0
 
+            if already:
+                _log.debug("_load_fits: already showing/loading %s", name)
+            else:
+                stretch = self._stretch_cache_get(abs_path)
+                _log.info("_load_fits: %s  [%s]  %s",
+                          "HIT" if stretch else "MISS", self._queue_info(), name)
+                if stretch is not None:
+                    self._pending_saved_viewport = None
+                    self._show_stretch(abs_path, stretch, saved_viewport)
+                else:
+                    # Replace the old image so it's obvious we moved on.
+                    self._pending_saved_viewport = saved_viewport
+                    self._displayed_path = None
+                    self._failed.pop(abs_path, None)    # retry failed files
+                    self.main_container.set_view(LoadingWidget(name))
+                    self._request(abs_path, self._PRIO_CURRENT)
+
             self._trigger_preload(
                 _config.config["preload_ahead"],
                 _config.config["preload_behind"]
             )
-            
-            # Immediately update buffer gauges to reflect the loaded view's buffer state
             self._update_buffer_gauges()
 
             _log.debug("_load_fits: TOTAL %.1f ms  [%s]  %s",
@@ -1919,75 +2040,30 @@ class MainWindow(QMainWindow):
             traceback.print_exc(file=sys.stderr)
             self.main_container.set_view(QLabel(f"Error loading file:\n{e}"))
 
-    def _deliver_stretch(self, gen: int, path: str, sd: _StretchData):
-        """Called on the main thread when async stretch build completes."""
-        if gen != self._stretch_generation:
-            _log.debug("_deliver_stretch: stale gen %d (current %d), discarding [%s]  %s",
-                       gen, self._stretch_generation, self._queue_info(),
-                       os.path.basename(path))
-            return
-        self._stretch_cache_put(path, sd)
-
-        # Resolve the saved viewport now that we know the image dimensions.
-        saved_vp = self._pending_saved_viewport
-        self._pending_saved_viewport = None
-        vp_to_restore = None
-        if saved_vp is not None:
-            old_size = saved_vp[-1]
-            if old_size == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
-                vp_to_restore = saved_vp
-                _log.debug("_deliver_stretch: matched old size %s, propagating vp_to_restore", old_size)
-            else:
-                _log.debug("_deliver_stretch: size mismatch, discarding saved_viewport")
-
-        _log.debug("_deliver_stretch: installing [%s]  %s",
-                   self._queue_info(), os.path.basename(path))
-        is_bad = path in self._bad_files
-        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
-        self.main_container.set_view(view, sd.raw_header)
-        
-        if sd.fwhm > 0.0:
-            self._fwhm_db[path] = sd.fwhm
-        if self.main_container is not None:
-            self.main_container.update_fwhm_db(self._fwhm_db, self._bad_files, self._current_path)
-            
-        self._update_buffer_gauges()
-
     def _update_buffer_gauges(self):
         if not self._fits_files:
             if self.main_container is not None:
                 self.main_container.update_gauges(1.0, 1.0)
             return
-            
-        def is_buffered(path: str) -> bool:
-            if path in self._stretch_cache:
-                return True
-            f = self._preload_futures.get(path)
-            if f is None or not f.done() or f.cancelled():
-                return False
-            return f.exception() is None
-            
-        idx = self._current_index
-        n = len(self._fits_files)
-        
-        ahead = self._current_ahead
-        behind = self._current_behind
-        d = self._nav_direction
-        
-        back_count = 0
-        for i in range(1, behind + 1):
-            if is_buffered(self._fits_files[(idx - d * i) % n]):
-                back_count += 1
-                
-        fwd_count = 0
-        for i in range(1, ahead + 1):
-            if is_buffered(self._fits_files[(idx + d * i) % n]):
-                fwd_count += 1
-                
-        back_pct = back_count / behind if behind > 0 else 1.0
-        fwd_pct = fwd_count / ahead if ahead > 0 else 1.0
-        _log.info("_update_buffer_gauges: back %d/%d (%.2f)  fwd %d/%d (%.2f)",
-                  back_count, behind, back_pct, fwd_count, ahead, fwd_pct)
+
+        idx, n, d = self._current_index, len(self._fits_files), self._nav_direction
+
+        def count(sign: int, depth: int) -> tuple[int, int]:
+            have = total = 0
+            for i in range(1, depth + 1):
+                j = idx + sign * d * i
+                if not 0 <= j < n:
+                    break
+                total += 1
+                have += self._fits_files[j] in self._stretch_cache
+            return have, total
+
+        back_count, back_total = count(-1, self._current_behind)
+        fwd_count, fwd_total = count(+1, self._current_ahead)
+        back_pct = back_count / back_total if back_total else 1.0
+        fwd_pct = fwd_count / fwd_total if fwd_total else 1.0
+        _log.debug("_update_buffer_gauges: back %d/%d  fwd %d/%d",
+                   back_count, back_total, fwd_count, fwd_total)
         if self.main_container is not None:
             self.main_container.update_gauges(back_pct, fwd_pct)
 
@@ -2012,13 +2088,15 @@ class MainWindow(QMainWindow):
         _log.info("key: %s  [%s]", "→" if delta > 0 else "←", self._queue_info())
         t0 = time.perf_counter()
         self._nav_direction = 1 if delta > 0 else -1
-        saved_vp = None
         view = self.main_container.get_view()
         if isinstance(view, FitsView):
             saved_vp = view.viewport_state()
-            _log.debug("_navigate: captured saved_vp %s", bool(saved_vp))
+        else:
+            # Loading/error screen: carry the last real viewport forward.
+            saved_vp = self._pending_saved_viewport
         self._current_index = new_idx
-        self._load_fits(self._fits_files[self._current_index], saved_viewport=saved_vp)
+        self._load_fits(self._fits_files[self._current_index],
+                        saved_viewport=saved_vp, reindex=False)
         _log.debug("_navigate: TOTAL %.1f ms  [%s]", (time.perf_counter() - t0) * 1000,
                    self._queue_info())
 
@@ -2062,7 +2140,9 @@ class MainWindow(QMainWindow):
     def _commit_bad_files(self):
         if not self._bad_files: return
         
-        current_path = self._fits_files[self._current_index]
+        old_files = list(self._fits_files)
+        old_index = self._current_index
+        current_path = old_files[old_index]
         parent_dir = os.path.dirname(current_path)
         bad_dir = os.path.join(parent_dir, "bad")
         os.makedirs(bad_dir, exist_ok=True)
@@ -2071,6 +2151,13 @@ class MainWindow(QMainWindow):
         _log.info("key: Enter (moving %d bad files to %s)", count, bad_dir)
         
         for bad_file in list(self._bad_files):
+            # Forget everything about the old path: queued read, cached
+            # image, FWHM sample (would otherwise skew the session average).
+            if self._io.cancel(bad_file):
+                self._inflight.discard(bad_file)
+            self._stretch_cache.pop(bad_file, None)
+            self._failed.pop(bad_file, None)
+            self._fwhm_db.pop(bad_file, None)
             try:
                 shutil.move(bad_file, os.path.join(bad_dir, os.path.basename(bad_file)))
             except Exception as e:
@@ -2080,8 +2167,11 @@ class MainWindow(QMainWindow):
         
         # Re-index
         self._fits_files = _fits_siblings(current_path)
+        self._fits_dir = parent_dir
         if not self._fits_files:
             self._current_index = 0
+            self._current_path = ""
+            self._displayed_path = None
             self.setWindowTitle("FITS Preview — Empty")
             
             label = QLabel("u got no imgs bro 🤷‍♂️")
@@ -2091,19 +2181,21 @@ class MainWindow(QMainWindow):
             label.setFont(font)
             self.main_container.set_view(label, None)
             return
-            
-        if self._current_index >= len(self._fits_files):
-            self._current_index = len(self._fits_files) - 1
-            
-        self._load_fits(self._fits_files[self._current_index])
+
+        # Stay on the current image if it survived; otherwise show the next
+        # surviving one after it (or the last one before it at the end).
+        remaining = set(self._fits_files)
+        target = next((p for p in old_files[old_index:] if p in remaining), None)
+        if target is None:
+            target = next((p for p in reversed(old_files[:old_index]) if p in remaining),
+                          self._fits_files[-1])
+        self._load_fits(target, reindex=False)
 
     def _shutdown(self):
-        """Cancel pending work and stop executor threads immediately on quit."""
-        _log.debug("shutdown: cancelling %d preload futures", len(self._preload_futures))
-        for f in self._preload_futures.values():
-            f.cancel()
-        self._preload_futures.clear()
-        self._io_executor.shutdown(wait=False, cancel_futures=True)
+        """Cancel pending work and stop worker threads immediately on quit."""
+        _log.debug("shutdown: dropping %d queued reads", self._io.queued())
+        self._io.stop()
+        self._inflight.clear()
         self._compute_executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -2112,16 +2204,63 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 class FitsApp(QApplication):
+    # Emitted from the IPC accept-loop thread; queued connection (Qt's
+    # default for cross-thread signals) delivers it safely on the GUI thread.
+    _file_received = Signal(str)
+
     def __init__(self, argv):
         super().__init__(argv)
         self._pending_file: str | None = None
         self._main_window: MainWindow | None = None
+        self._ipc_listener = None
+        self._ipc_thread: threading.Thread | None = None
+        self._file_received.connect(self._on_file_received)
 
     def set_main_window(self, window: MainWindow):
         self._main_window = window
         if self._pending_file:
             self._main_window._load_fits(self._pending_file)
             self._pending_file = None
+
+    def start_ipc_listener(self, listener) -> None:
+        """Become resident: accept file-open handoffs from future launcher.py
+        invocations for the lifetime of this process, instead of each one
+        spawning a brand-new interpreter that re-pays import/JIT startup cost.
+        """
+        self._ipc_listener = listener
+        self._ipc_thread = threading.Thread(
+            target=self._ipc_accept_loop, name="fits-ipc", daemon=True)
+        self._ipc_thread.start()
+
+    def _ipc_accept_loop(self) -> None:
+        while True:
+            try:
+                conn = self._ipc_listener.accept()
+            except OSError:
+                return  # listener was closed (app shutting down)
+            try:
+                path = conn.recv()
+            except EOFError:
+                continue
+            finally:
+                conn.close()
+            if path:
+                self._file_received.emit(path)
+
+    def _on_file_received(self, path: str) -> None:
+        if self._main_window:
+            self._main_window._load_fits(path)
+            self._main_window.raise_()
+            self._main_window.activateWindow()
+        else:
+            self._pending_file = path
+
+    def shutdown_ipc(self) -> None:
+        if self._ipc_listener is not None:
+            try:
+                self._ipc_listener.close()
+            except OSError:
+                pass
 
     def event(self, event: QEvent) -> bool:
         if isinstance(event, QFileOpenEvent):
@@ -2145,7 +2284,11 @@ def _install_stderr_excepthook():
 def run_headless(fits_path: str, out_path: str, stretch_type: str):
     """Executes the pipeline without spawning a PySide6 GUI and saves the output."""
     _log.info(f"Running in headless mode. Input: {fits_path}")
-    raw_data, raw_header = _load_path_raw_data(fits_path)
+    try:
+        raw_data, raw_header = _load_path_raw_data(fits_path)
+    except Exception:
+        _log.exception("Failed to read FITS file: %s", fits_path)
+        sys.exit(1)
     if raw_data is None:
         _log.error("Failed to load FITS data.")
         sys.exit(1)
@@ -2231,10 +2374,26 @@ def main():
         run_headless(args.file, args.out, args.stretch)
         return
 
+    # Single-instance daemon mode: if another py-fits-preview is already
+    # resident, hand it the file and exit rather than opening a second
+    # window (launcher.py does this same check before paying import cost;
+    # this covers main.py being invoked directly).
+    if ipc.connect_to_daemon(args.file):
+        return
+
     app = FitsApp([sys.argv[0]])
     window = MainWindow(args.file)
     app.aboutToQuit.connect(window._shutdown)
     app.set_main_window(window)
+
+    # Try to become the daemon so future file opens reuse this process
+    # instead of paying startup cost again. If another instance won the
+    # race for the socket, just carry on as a normal, non-resident window.
+    listener = ipc.start_listener()
+    if listener is not None:
+        app.start_ipc_listener(listener)
+        app.aboutToQuit.connect(app.shutdown_ipc)
+
     window.show()
     sys.exit(app.exec())
 

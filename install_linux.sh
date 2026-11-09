@@ -16,7 +16,7 @@ cat > "$DESKTOP_DIR/$APP_NAME" << EOF
 Version=1.0
 Name=FITS Preview
 Comment=Extremely fast preloading FITS image viewer
-Exec=bash -c "cd '$REPO_DIR' && uv run python3 main.py %f"
+Exec=bash -c "cd '$REPO_DIR' && uv run python3 launcher.py %f"
 Icon=image-x-generic
 Terminal=false
 Type=Application
