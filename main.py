@@ -26,11 +26,43 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QFileOpenEvent, QKeySequence, QShortcut,
-    QPainter, QColor, QPen, QBrush,
+    QPainter, QColor, QPen, QBrush, QPalette,
 )
 from PySide6.QtCore import Qt, QEvent, QTimer, Signal, QPropertyAnimation, QRectF, Property
 
 _log = logging.getLogger(__name__)
+
+
+def _apply_dark_theme(app: QApplication) -> None:
+    """Force a dark Fusion palette (non-macOS).
+
+    On GNOME, Qt's gtk3 platform theme reports a *light* palette even with
+    ``color-scheme 'prefer-dark'``, so windows render white and every view
+    swap flashes the light Base colour before the image paints.  An image
+    viewer wants dark regardless, so don't rely on desktop detection.
+    macOS already follows the system appearance correctly.
+    """
+    app.setStyle("Fusion")
+    window, base, text = QColor(37, 37, 37), QColor(24, 24, 24), QColor(220, 220, 220)
+    disabled = QColor(120, 120, 120)
+    p = QPalette()
+    R = QPalette.ColorRole
+    for role, c in (
+        (R.Window, window), (R.WindowText, text), (R.Base, base),
+        (R.AlternateBase, window), (R.ToolTipBase, QColor(0, 0, 0)),
+        (R.ToolTipText, text), (R.PlaceholderText, disabled), (R.Text, text),
+        (R.Button, QColor(53, 53, 53)), (R.ButtonText, text),
+        (R.BrightText, QColor(255, 80, 80)), (R.Link, QColor(90, 160, 255)),
+        (R.Highlight, QColor(60, 110, 190)), (R.HighlightedText, QColor(255, 255, 255)),
+        (R.Light, QColor(70, 70, 70)), (R.Midlight, QColor(55, 55, 55)),
+        (R.Mid, QColor(45, 45, 45)), (R.Dark, QColor(20, 20, 20)),
+        (R.Shadow, QColor(0, 0, 0)),
+    ):
+        p.setColor(role, c)
+    G = QPalette.ColorGroup.Disabled
+    for role in (R.WindowText, R.Text, R.ButtonText):
+        p.setColor(G, role, disabled)
+    app.setPalette(p)
 
 
 # ---------------------------------------------------------------------------
@@ -963,14 +995,20 @@ class MainContainer(QWidget):
         self._fwhm_gauge.update_db(db, bad, current)
         
     def set_view(self, view: QWidget, header_data=None):
-        if self._current_view:
-            self.view_layout.removeWidget(self._current_view)
-            self._current_view.setParent(None)
-            if hasattr(self._current_view, 'teardown'):
-                self._current_view.teardown()
-            self._current_view.deleteLater()
+        # Add the new view before removing the old one, with updates held,
+        # so the container never paints an empty frame between images.
+        self.view_container.setUpdatesEnabled(False)
+        old = self._current_view
         self._current_view = view
-        self.view_layout.addWidget(self._current_view)
+        self.view_layout.addWidget(view)
+        if old:
+            self.view_layout.removeWidget(old)
+            old.hide()
+            old.setParent(None)
+            if hasattr(old, 'teardown'):
+                old.teardown()
+            old.deleteLater()
+        self.view_container.setUpdatesEnabled(True)
         
         if hasattr(self._current_view, 'stretch_applied'):
             self._current_view.stretch_applied.connect(self._histogram.set_data)
@@ -2149,6 +2187,8 @@ class FitsApp(QApplication):
 
     def __init__(self, argv):
         super().__init__(argv)
+        if sys.platform != "darwin":
+            _apply_dark_theme(self)
         self._pending_file: str | None = None
         self._main_window: MainWindow | None = None
         self._ipc_listener = None
