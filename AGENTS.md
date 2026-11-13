@@ -14,3 +14,4 @@
 
 ## Linux theming
 - On GNOME, Qt's gtk3 platform theme reports a light palette even with `color-scheme 'prefer-dark'`. `FitsApp` therefore forces a dark Fusion palette on non-macOS (`_apply_dark_theme`). Don't remove it in favour of desktop detection. A light Base colour shows as a white flash on every view swap.
+- Navigation reuses the live `FitsView` (`replace_image`) instead of building a new widget per image. A fresh view paints the background before its image on Linux/Wayland. Only create a new `FitsView` when the current view is a loading or error screen.

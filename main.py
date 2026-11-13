@@ -1322,11 +1322,13 @@ class FitsView(QGraphicsView):
     def __init__(self, qimage: QImage,
                  stretch: _StretchData | None = None,
                  saved_viewport=None, is_bad: bool = False, parent=None):
-        pixmap = QPixmap.fromImage(qimage)
         super().__init__(parent)
 
         scene = QGraphicsScene(self)
-        self._item = QGraphicsPixmapItem(pixmap)
+        # _install_stretch sets the pixmap from stretch.mtf_qimage; don't
+        # convert the same ~47 MP image twice.
+        same = stretch is not None and stretch.mtf_qimage is qimage
+        self._item = QGraphicsPixmapItem() if same else QGraphicsPixmapItem(QPixmap.fromImage(qimage))
         self._item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         scene.addItem(self._item)
         self.setScene(scene)
@@ -1343,7 +1345,7 @@ class FitsView(QGraphicsView):
         self._magnifier = MagnifierOverlay(self.viewport())
         self._magnifier.hide()
 
-        self._pixmap_size = (pixmap.width(), pixmap.height())
+        self._pixmap_size = (qimage.width(), qimage.height())
         self._saved_viewport = saved_viewport
         self._fit_pending    = False
         self._initial_fit_done = saved_viewport is not None
@@ -1406,6 +1408,28 @@ class FitsView(QGraphicsView):
             self._item.setPixmap(QPixmap.fromImage(stretch.mtf_qimage))
         else:
             self.apply_mtf_stretch()
+
+    def replace_image(self, stretch: _StretchData, is_bad: bool = False):
+        """Show another image in this same view.
+
+        Navigation swaps the pixmap in place instead of building a new
+        widget, so the old image stays on screen until the new one replaces
+        it in a single repaint (no blank/background frame in between; this
+        was visible on Linux).  Zoom and scroll carry over unchanged when
+        the size matches; a different-sized image is fitted.
+        """
+        old_size = self._pixmap_size
+        img = stretch.mtf_qimage
+        self._pixmap_size = (img.width(), img.height())
+        self._magnifier.hide()
+        if getattr(self, '_eol_anim', None) is not None:
+            self._eol_anim.stop()
+        self._eol_label.setVisible(False)
+        self._bad_label.setVisible(is_bad)
+        self._install_stretch(stretch)      # sets pixmap, emits stretch_applied
+        if self._pixmap_size != old_size:
+            self.scene().setSceneRect(self._item.boundingRect())
+            self._fit()
 
     def set_stretch_data(self, stretch: _StretchData):
         """Deliver stretch data that arrived asynchronously after init."""
@@ -1950,15 +1974,22 @@ class MainWindow(QMainWindow):
 
     def _show_stretch(self, path: str, sd: _StretchData, saved_viewport=None):
         """Display a ready image (main thread)."""
-        vp_to_restore = None
-        if saved_viewport is not None:
-            if saved_viewport[-1] == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
-                vp_to_restore = saved_viewport
-            else:
-                _log.debug("_show_stretch: size mismatch, discarding saved_viewport")
-        view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore,
-                        is_bad=path in self._bad_files)
-        self.main_container.set_view(view, sd.raw_header)
+        is_bad = path in self._bad_files
+        current = self.main_container.get_view()
+        if isinstance(current, FitsView) and current.scene() is not None:
+            # Reuse the live view: one repaint from old image to new, and the
+            # zoom/scroll carry over by themselves (see replace_image).
+            current.replace_image(sd, is_bad=is_bad)
+            self.main_container.header_panel.update_header(sd.raw_header)
+        else:
+            vp_to_restore = None
+            if saved_viewport is not None:
+                if saved_viewport[-1] == (sd.mtf_qimage.width(), sd.mtf_qimage.height()):
+                    vp_to_restore = saved_viewport
+                else:
+                    _log.debug("_show_stretch: size mismatch, discarding saved_viewport")
+            view = FitsView(sd.mtf_qimage, sd, saved_viewport=vp_to_restore, is_bad=is_bad)
+            self.main_container.set_view(view, sd.raw_header)
         self._displayed_path = path
         if sd.fwhm > 0.0:
             self._fwhm_db[path] = sd.fwhm
